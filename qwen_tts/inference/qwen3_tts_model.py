@@ -17,7 +17,7 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import librosa
@@ -631,6 +631,120 @@ class Qwen3TTSModel:
                 wavs_out.append(wav)
 
         return wavs_out, fs
+
+    @torch.inference_mode()
+    def stream_generate_voice_clone(
+        self,
+        text: str,
+        language: str = None,
+        ref_audio: Optional[AudioLike] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], VoiceClonePromptItem]] = None,
+        non_streaming_mode: bool = False,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        max_frames: int = 10000,
+        **kwargs,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Stream voice clone speech generation, yielding PCM chunks as they are generated.
+
+        NOTE: This method only supports single-sample generation (no batching).
+
+        Args:
+            text: Text to synthesize (single string only).
+            language: Language for synthesis.
+            ref_audio: Reference audio for prompt building (required if voice_clone_prompt not provided).
+            ref_text: Reference text for ICL mode.
+            x_vector_only_mode: If True, only speaker embedding is used.
+            voice_clone_prompt: Pre-built VoiceClonePromptItem from create_voice_clone_prompt.
+            non_streaming_mode: Whether to use non-streaming text input mode.
+            emit_every_frames: Emit PCM chunk every N codec frames.
+            decode_window_frames: Window size for decoding (longer = better quality, more latency).
+            overlap_samples: Overlap samples for crossfade between chunks.
+            max_frames: Maximum codec frames to generate.
+            **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
+
+        Yields:
+            Tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
+        """
+        if self.model.tts_model_type != "base":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_voice_clone"
+            )
+
+        if isinstance(text, list):
+            raise ValueError("stream_generate_voice_clone only supports single text, not batch")
+
+        texts = [text]
+        languages = [language if language is not None else "Auto"]
+        self._validate_languages(languages)
+
+        # Build voice clone prompt
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                raise ValueError("Either voice_clone_prompt or ref_audio must be provided")
+            prompt_items = self.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode
+            )
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [prompt_items[0].ref_text]
+        elif isinstance(voice_clone_prompt, VoiceClonePromptItem):
+            prompt_items = [voice_clone_prompt]
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [voice_clone_prompt.ref_text]
+        elif isinstance(voice_clone_prompt, list):
+            # List of VoiceClonePromptItem
+            prompt_items = voice_clone_prompt
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [prompt_items[0].ref_text]
+        else:
+            # Already a dict
+            voice_clone_prompt_dict = voice_clone_prompt
+            ref_texts_for_ids = None
+
+        input_texts = [self._build_assistant_text(t) for t in texts]
+        input_ids = self._tokenize_texts(input_texts)
+
+        ref_ids = None
+        if ref_texts_for_ids is not None:
+            ref_ids = []
+            for rt in ref_texts_for_ids:
+                if rt is None or rt == "":
+                    ref_ids.append(None)
+                else:
+                    ref_tok = self._tokenize_texts([self._build_ref_text(rt)])[0]
+                    ref_ids.append(ref_tok)
+
+        # Extract streaming params, filter to only supported ones
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        # Only keep params supported by stream_generate_pcm
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        # Call streaming generation
+        for chunk, sr in self.model.stream_generate_pcm(
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
 
     # voice design model
     @torch.no_grad()
