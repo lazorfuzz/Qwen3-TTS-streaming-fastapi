@@ -101,13 +101,18 @@ def main():
     log_time(start, "Model loaded")
 
     # Reference audio setup
-    ref_audio_path = "kuklina-1.wav"
+    # ref_audio_path = "kuklina-1.wav"
+    # ref_text = (
+    #     "Это брат Кэти, моей одноклассницы. А что у тебя с рукой? И почему ты голая? У него ведь куча наград по "
+    #     "боевым искусствам. Кэти рассказывала, правда, Лео? Понимаешь кого ты побила, Лая? "
+    #     "Только потрогай эти мышцы... Не знала, что у тебя такой классный котик. Рожденная луной. "
+    #     "Лай всегда откопает что-нибудь этакое. Да, жаль только, что занимает почти всё её время. "
+    #     "Не понимаю, почему эта рухлядь не может подождать, пока ты проведешь время с сестрой."
+    # )
+
+    ref_audio_path = "eesha_voice_cloning.wav"
     ref_text = (
-        "Это брат Кэти, моей одноклассницы. А что у тебя с рукой? И почему ты голая? У него ведь куча наград по "
-        "боевым искусствам. Кэти рассказывала, правда, Лео? Понимаешь кого ты побила, Лая? "
-        "Только потрогай эти мышцы... Не знала, что у тебя такой классный котик. Рожденная луной. "
-        "Лай всегда откопает что-нибудь этакое. Да, жаль только, что занимает почти всё её время. "
-        "Не понимаю, почему эта рухлядь не может подождать, пока ты проведешь время с сестрой."
+        "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
     )
 
     start = time.time()
@@ -118,7 +123,8 @@ def main():
     log_time(start, "Voice clone prompt created")
 
     # Test text
-    test_text = "Всем привет! Это тестовый текст для озвучки! Теперь стриминг звучит хорошо сразу."
+    test_text = '''I can say anything you want me to say. I am a model that takes in text and produces speech.
+        Cool, right? Well, it's a living. Can't complain. Want me to talk about superchargers? Or Tesla Model Y's? Sure thing!'''
 
     results = []
 
@@ -130,7 +136,7 @@ def main():
     start = time.time()
     wavs, sr = model.generate_voice_clone(
         text=test_text,
-        language="Russian",
+        language="English",
         voice_clone_prompt=voice_clone_prompt,
     )
     standard_time = time.time() - start
@@ -151,7 +157,7 @@ def main():
     print("=" * 60)
 
     result = run_streaming_test(
-        model, test_text, "Russian", voice_clone_prompt,
+        model, test_text, "English", voice_clone_prompt,
         emit_every_frames=EMIT_EVERY,
         decode_window_frames=DECODE_WINDOW,
         label="streaming_baseline",
@@ -175,12 +181,13 @@ def main():
         use_compile=True,
         use_cuda_graphs=False,  # Not needed with reduce-overhead mode
         compile_mode="reduce-overhead",
+        # compile_mode="max_autotune",
     )
 
     # Warmup run (first run after compile is slower due to compilation)
     print("\nWarmup run (first run after compile)...")
     warmup_result = run_streaming_test(
-        model, "Тест один два три четыре пять.", "Russian", voice_clone_prompt,
+        model, "Test one two three four five.", "English", voice_clone_prompt,
         emit_every_frames=EMIT_EVERY,
         decode_window_frames=DECODE_WINDOW,
         label="warmup",
@@ -191,7 +198,7 @@ def main():
     # Actual test run
     print("\nOptimized test run...")
     result = run_streaming_test(
-        model, test_text, "Russian", voice_clone_prompt,
+        model, test_text, "English", voice_clone_prompt,
         emit_every_frames=EMIT_EVERY,
         decode_window_frames=DECODE_WINDOW,
         label="streaming_optimized",
@@ -205,7 +212,7 @@ def main():
     # Second optimized run to show stable performance
     print("\nSecond optimized run...")
     result2 = run_streaming_test(
-        model, test_text, "Russian", voice_clone_prompt,
+        model, test_text, "English", voice_clone_prompt,
         emit_every_frames=EMIT_EVERY,
         decode_window_frames=DECODE_WINDOW,
         label="streaming_optimized_2",

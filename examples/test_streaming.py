@@ -15,7 +15,7 @@ total_start = time.time()
 
 start = time.time()
 clone_model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     device_map="cuda:0",
     dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
@@ -25,13 +25,9 @@ start = log_time(start, "Load Base model")
 # for real speedup, use vLLM for LM inference (or SGlang probably)
 # torch.compile doesn't help much for autoregressive generation due to dynamic shapes
 
-ref_audio_path = "kuklina-1.wav"
+ref_audio_path = "eesha_voice_cloning.wav"
 ref_text = (
-    "Это брат Кэти, моей одноклассницы. А что у тебя с рукой? И почему ты голая? У него ведь куча наград по "
-    "боевым искусствам. Кэти рассказывала, правда, Лео? Понимаешь кого ты побила, Лая? "
-    "Только потрогай эти мышцы... Не знала, что у тебя такой классный котик. Рожденная луной. "
-    "Лай всегда откопает что-нибудь этакое. Да, жаль только, что занимает почти всё её время. "
-    "Не понимаю, почему эта рухлядь не может подождать, пока ты проведешь время с сестрой."
+    "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
 )
 
 voice_clone_prompt = clone_model.create_voice_clone_prompt(
@@ -41,14 +37,27 @@ voice_clone_prompt = clone_model.create_voice_clone_prompt(
 start = log_time(start, "Create voice clone prompt")
 
 # Test sentence
-test_text = "Всем привет! Это тестовый текст для озвучки! Стриминг звучит нормально только через несколько секунд."
+test_text = "Hi, how are you today? This is a test of the voice cloning capabilities."
+
+# ============== prewarm generation ==============
+for _ in range(4):
+    print("\n--- prewarm generation ---")
+    start = time.time()
+    wavs, sr = clone_model.generate_voice_clone(
+        text=test_text,
+        language="English",
+        voice_clone_prompt=voice_clone_prompt,
+    )
+    prewarm_time = time.time() - start
+    print(f"[{prewarm_time:.2f}s] prewarm generate ({len(test_text)} chars)")
+    sf.write("clone_prewarm.wav", wavs[0], sr)
 
 # ============== Standard generation ==============
 print("\n--- Standard generation ---")
 start = time.time()
 wavs, sr = clone_model.generate_voice_clone(
     text=test_text,
-    language="Russian",
+    language="English",
     voice_clone_prompt=voice_clone_prompt,
 )
 standard_time = time.time() - start
@@ -56,28 +65,29 @@ print(f"[{standard_time:.2f}s] Standard generate ({len(test_text)} chars)")
 sf.write("clone_standard.wav", wavs[0], sr)
 
 # ============== Streaming generation ==============
-print("\n--- Streaming generation ---")
-start = time.time()
-chunks = []
-first_chunk_time = None
-chunk_count = 0
+for _ in range(4):
+    print("\n--- Streaming generation ---")
+    start = time.time()
+    chunks = []
+    first_chunk_time = None
+    chunk_count = 0
 
-for chunk, chunk_sr in clone_model.stream_generate_voice_clone(
-    text=test_text,
-    language="Russian",
-    voice_clone_prompt=voice_clone_prompt,
-    emit_every_frames=8,
-    decode_window_frames=80,
-    overlap_samples=512,
-):
-    chunk_count += 1
-    chunks.append(chunk)
-    if first_chunk_time is None:
-        first_chunk_time = time.time() - start
-        print(f"[{first_chunk_time:.2f}s] First chunk received ({len(chunk)} samples)")
+    for chunk, chunk_sr in clone_model.stream_generate_voice_clone(
+        text=test_text,
+        language="English",
+        voice_clone_prompt=voice_clone_prompt,
+        emit_every_frames=2, # is this even safe???
+        decode_window_frames=80,
+        overlap_samples=512,
+    ):
+        chunk_count += 1
+        chunks.append(chunk)
+        if first_chunk_time is None:
+            first_chunk_time = time.time() - start
+            print(f"[{first_chunk_time:.2f}s] First chunk received ({len(chunk)} samples)")
 
-streaming_time = time.time() - start
-print(f"[{streaming_time:.2f}s] Streaming complete ({chunk_count} chunks)")
+    streaming_time = time.time() - start
+    print(f"[{streaming_time:.2f}s] Streaming complete ({chunk_count} chunks)")
 
 # concatenate
 final_audio = np.concatenate(chunks)
