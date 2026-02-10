@@ -1,0 +1,20 @@
+name: qwen3-tts
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - torch
+  - pip:
+      - fastapi
+      - uvicorn
+      - pydantic
+      - soundfile
+      - gradio
+      - librosa
+      - torchaudio
+      - sox
+      - onnxruntime
+      - einops
+      - transformers==4.57.3
+      - accelerate==1.12.0
+      # Add any other pip dependencies from pyproject.toml here

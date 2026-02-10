@@ -1,0 +1,27 @@
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.egg-info/
+assets/
+examples/
+finetuning/
+from_speech4.pcap
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.zip
+*.tar.gz
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.log
+.DS_Store
+.env
+.vscode/
+.git/
