@@ -34,6 +34,9 @@ model.enable_streaming_optimizations(
     use_compile=True,
     use_cuda_graphs=False,  # Not needed with reduce-overhead mode
     compile_mode="max-autotune-no-cudagraphs",
+    use_fast_codebook=True,
+    compile_codebook_predictor=True,
+    compile_talker=True,
 )
 
 DEFAULT_VOICE_CLONE_REF_PATH = "eesha_voice_cloning.wav"

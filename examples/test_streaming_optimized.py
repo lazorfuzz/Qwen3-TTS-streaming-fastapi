@@ -4,7 +4,7 @@ Test streaming TTS with torch.compile and CUDA graphs optimizations.
 This script compares:
 1. Standard (non-streaming) generation
 2. Streaming without optimizations
-3. Streaming with torch.compile + CUDA graphs
+3. Streaming with torch.compile + CUDA graphs (decoder, talker, codebook predictor)
 
 Usage:
     cd Qwen3-TTS
@@ -32,7 +32,7 @@ def run_streaming_test(
     text: str,
     language: str,
     voice_clone_prompt,
-    emit_every_frames: int = 8,
+    emit_every_frames: int = 4,
     decode_window_frames: int = 80,
     label: str = "streaming",
 ):
@@ -50,7 +50,7 @@ def run_streaming_test(
         voice_clone_prompt=voice_clone_prompt,
         emit_every_frames=emit_every_frames,
         decode_window_frames=decode_window_frames,
-        overlap_samples=512,
+        overlap_samples=0,
     ):
         chunk_count += 1
         chunks.append(chunk)
@@ -170,17 +170,22 @@ def main():
 
     # ============== Test 3: Streaming WITH optimizations ==============
     print("\n" + "=" * 60)
-    print("Test 3: Streaming WITH decoder torch.compile")
+    print("Test 3: Streaming WITH torch.compile (decoder + talker + codebook)")
     print("=" * 60)
 
     # Enable optimizations - this is the key step!
     # - Decoder torch.compile with reduce-overhead mode (includes CUDA graphs)
+    # - Talker model compilation for faster main generation loop
+    # - Codebook predictor compilation
     print("\nEnabling streaming optimizations...")
     model.enable_streaming_optimizations(
         decode_window_frames=DECODE_WINDOW,
         use_compile=True,
         use_cuda_graphs=False,  # Not needed with reduce-overhead mode
         compile_mode="reduce-overhead",
+        use_fast_codebook=True,
+        compile_codebook_predictor=True,
+        compile_talker=True,
         # compile_mode="max_autotune",
     )
 
@@ -226,16 +231,17 @@ def main():
     print("SUMMARY")
     print("=" * 80)
 
-    baseline_total = results[1]["total_time"]
-    baseline_first = results[1]["first_chunk_time"]
+    baseline_result = results[1]  # streaming_baseline
+    baseline_audio_dur = baseline_result.get("audio_duration", 0)
+    baseline_rtf = baseline_result["total_time"] / baseline_audio_dur if baseline_audio_dur > 0 else 0
 
-    print(f"\n{'Method':<25} {'1st Chunk':>10} {'Total':>8} {'Audio':>8} {'RTF':>6} {'Chunks':>7} {'Speedup':>8}")
+    print(f"\n{'Method':<25} {'1st Chunk':>10} {'Total':>8} {'Audio':>8} {'RTF':>6} {'Chunks':>7} {'RTF Speedup':>12}")
     print("-" * 80)
 
     # Standard generation
     std = results[0]
     std_rtf = std['total_time'] / std['audio_duration'] if std.get('audio_duration', 0) > 0 else 0
-    print(f"{'Standard (no streaming)':<25} {'N/A':>10} {std['total_time']:>7.2f}s {std.get('audio_duration', 0):>7.2f}s {std_rtf:>6.2f} {'N/A':>7} {'N/A':>8}")
+    print(f"{'Standard (no streaming)':<25} {'N/A':>10} {std['total_time']:>7.2f}s {std.get('audio_duration', 0):>7.2f}s {std_rtf:>6.2f} {'N/A':>7} {'N/A':>12}")
 
     for r in results[1:]:
         first = r.get("first_chunk_time", 0)
@@ -243,12 +249,21 @@ def main():
         audio_dur = r.get("audio_duration", 0)
         rtf = total / audio_dur if audio_dur > 0 else 0
         chunks = r.get("chunk_count", 0)
-        speedup_total = baseline_total / total if total > 0 else 0
-        print(f"{r['label']:<25} {first:>9.2f}s {total:>7.2f}s {audio_dur:>7.2f}s {rtf:>6.2f} {chunks:>7} {speedup_total:>7.2f}x")
+        speedup_rtf = baseline_rtf / rtf if rtf > 0 else 0
+        print(f"{r['label']:<25} {first:>9.2f}s {total:>7.2f}s {audio_dur:>7.2f}s {rtf:>6.2f} {chunks:>7} {speedup_rtf:>11.2f}x")
+
+    # Statistics for optimized runs (excluding baseline)
+    optimized_results = [r for r in results[2:] if r.get('audio_duration', 0) > 0]
+    if optimized_results:
+        avg_rtf = np.mean([r['total_time'] / r['audio_duration'] for r in optimized_results])
+        avg_first_chunk = np.mean([r['first_chunk_time'] for r in optimized_results])
+        print(f"\nOptimized runs statistics ({len(optimized_results)} runs):")
+        print(f"  Average RTF: {avg_rtf:.2f}")
+        print(f"  Average first chunk latency: {avg_first_chunk:.2f}s")
 
     # Chunk duration info
-    if results[1].get("avg_chunk_duration", 0) > 0:
-        print(f"\nChunk duration: ~{results[1]['avg_chunk_duration']*1000:.0f}ms ({results[1]['avg_chunk_samples']:.0f} samples @ {results[1]['sample_rate']}Hz)")
+    if baseline_result.get("avg_chunk_duration", 0) > 0:
+        print(f"\nChunk duration: ~{baseline_result['avg_chunk_duration']*1000:.0f}ms ({baseline_result['avg_chunk_samples']:.0f} samples @ {baseline_result['sample_rate']}Hz)")
 
     print(f"\n[{time.time() - total_start:.2f}s] TOTAL SCRIPT TIME")
 
@@ -262,7 +277,9 @@ def main():
 3. First run after compile is slow (compilation), subsequent runs are fast
 4. For lowest latency: use smaller emit_every_frames (e.g., 4)
 5. For best quality: use larger decode_window_frames (e.g., 80-100)
-6. You can also try compile_mode="max-autotune" for potentially better performance
+6. compile_talker=True compiles the main talker model (uses "default" mode internally)
+7. compile_codebook_predictor=True compiles the codebook predictor
+8. You can also try compile_mode="max-autotune" for potentially better performance
    (but longer initial compilation time)
 """)
 
