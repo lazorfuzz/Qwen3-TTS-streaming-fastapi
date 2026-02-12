@@ -87,7 +87,7 @@ logfile=${LOCAL_RUN_DIR}/logs/supervisord.log
 pidfile=${LOCAL_RUN_DIR}/supervisord.pid
 
 [program:nginx]
-command=nginx -e ${LOCAL_RUN_DIR}/logs/nginx_error.log -c ${LOCAL_RUN_DIR}/nginx.conf -g "daemon off;"
+command=nginx -c ${LOCAL_RUN_DIR}/nginx.conf -g "daemon off;"
 autorestart=true
 stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
