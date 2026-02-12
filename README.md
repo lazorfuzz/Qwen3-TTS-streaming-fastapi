@@ -63,8 +63,8 @@ If `TTS_API_KEY` is set, add `-H "Authorization: Bearer <your-key>"`.
 
 Run a concurrency test (default 2 concurrent requests):
 ```bash
-./concurrency_test.sh      # 2 concurrent requests
-./concurrency_test.sh 4    # 4 concurrent requests
+./concurrency_test.sh                            # 2 concurrent requests to localhost:8000
+./concurrency_test.sh http://<host>:8000 4       # custom host, 4 requests
 ```
 
 ## Installation (python 3.12)
