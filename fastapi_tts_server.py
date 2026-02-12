@@ -9,13 +9,15 @@ Lightweight FastAPI server exposing an OpenAI-compatible /v1/audio/speech endpoi
 Configuration via environment variables:
     TTS_NUM_WORKERS: Number of uvicorn worker processes (used by entrypoint.sh)
     TTS_VOICE_META_DIR: Directory for voice metadata JSON files (default: /app/voices)
+    TTS_API_KEY: Optional API key for Bearer auth on /v1/* endpoints (unset = auth disabled)
 """
 
 import asyncio
+import hmac
 import json
 import os
 import numpy as np
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from qwen_tts import Qwen3TTSModel
@@ -34,6 +36,7 @@ DEFAULT_VOICE_CLONE_REF_PATH = "eesha_voice_cloning.wav"
 DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
 
 VOICE_META_DIR = os.environ.get("TTS_VOICE_META_DIR", "/app/voices")
+API_KEY = os.environ.get("TTS_API_KEY")
 os.makedirs(VOICE_META_DIR, exist_ok=True)
 
 print(f"[INIT] Loading model (PID={os.getpid()})...", flush=True)
@@ -69,6 +72,21 @@ generation_semaphore = asyncio.Semaphore(1)
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency — enabled only when TTS_API_KEY is set
+# ---------------------------------------------------------------------------
+
+async def verify_api_key(request: Request):
+    if not API_KEY:
+        return
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing API key")
+    token = auth[7:]
+    if not hmac.compare_digest(token, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +129,7 @@ class AddVoiceRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/v1/add_voice")
+@app.post("/v1/add_voice", dependencies=[Depends(verify_api_key)])
 async def add_voice(body: AddVoiceRequest):
     """
     Register a voice for cloning. The .wav file must already exist in /app.
@@ -137,7 +155,7 @@ async def add_voice(body: AddVoiceRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/audio/speech")
+@app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
 async def speech_endpoint(request: Request, body: SpeechRequest):
     global _event_loop
     if _event_loop is None:

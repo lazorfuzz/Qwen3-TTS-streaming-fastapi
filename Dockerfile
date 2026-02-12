@@ -59,6 +59,7 @@ RUN mkdir -p /app/voices
 # Default env vars
 ENV TTS_NUM_WORKERS=2
 ENV TTS_VOICE_META_DIR=/app/voices
+ENV TTS_API_KEY=""
 
 # Expose port
 EXPOSE 8000
