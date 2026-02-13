@@ -18,7 +18,6 @@ import asyncio
 import hmac
 import json
 import os
-import queue
 import threading
 import traceback
 import numpy as np
@@ -89,7 +88,7 @@ class _BatchItem:
     text: str
     language: str
     voice_clone_prompt: object  # VoiceClonePromptItem
-    output_queue: queue.Queue
+    output_queue: asyncio.Queue
     stop_event: threading.Event
     start_time: float
 
@@ -98,22 +97,24 @@ class BatchScheduler:
     """
     Collects incoming TTS requests and dispatches them as batched forward passes.
 
-    Instead of N independent workers each doing batch_size=1, a single scheduler
-    batches up to max_batch_size requests into one forward pass, converting
-    matrix-vector ops into matrix-matrix ops for much higher GPU utilization.
+    The scheduler loop is a single coroutine: it collects a batch, then awaits
+    generation via run_in_executor (naturally serializing GPU access — no lock
+    needed). While generating, new requests accumulate in the pending queue and
+    are collected into the next batch immediately after the current one finishes.
+
+    Output uses asyncio.Queue + async generators, so no thread pool threads are
+    consumed for streaming responses.
     """
 
     def __init__(self, model, max_batch_size: int = 8, max_wait_s: float = 0.05):
         self.model = model
         self.max_batch_size = max_batch_size
         self.max_wait_s = max_wait_s
-
         self._pending: asyncio.Queue[_BatchItem] = asyncio.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._started = False
 
     async def start(self):
-        """Start the scheduler background loop. Must be called from async context."""
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
@@ -125,178 +126,104 @@ class BatchScheduler:
             flush=True,
         )
 
-    async def submit(self, text: str, language: str, voice_clone_prompt) -> tuple[queue.Queue, threading.Event]:
-        """
-        Submit a request for batched generation.
-
-        Returns (output_queue, stop_event). The caller consumes PCM bytes from
-        the queue until _SENTINEL is received. Setting stop_event cancels this
-        item without affecting others in the batch.
-        """
+    async def submit(self, text: str, language: str, voice_clone_prompt):
+        """Submit a request. Returns (asyncio.Queue, threading.Event)."""
         if not self._started:
             await self.start()
-
-        q = queue.Queue(maxsize=16)
-        stop_event = threading.Event()
-        item = _BatchItem(
-            text=text,
-            language=language,
-            voice_clone_prompt=voice_clone_prompt,
-            output_queue=q,
-            stop_event=stop_event,
-            start_time=time.time(),
+        q = asyncio.Queue()
+        stop = threading.Event()
+        await self._pending.put(
+            _BatchItem(text, language, voice_clone_prompt, q, stop, time.time())
         )
-        await self._pending.put(item)
-        return q, stop_event
+        return q, stop
 
     async def _scheduler_loop(self):
-        """Background loop: collect requests, dispatch batches."""
         while True:
-            # Wait for at least one request
-            first = await self._pending.get()
-            batch = [first]
-
-            # Collect more requests up to max_batch_size or max_wait_s
+            batch = [await self._pending.get()]
             deadline = time.monotonic() + self.max_wait_s
             while len(batch) < self.max_batch_size:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 try:
-                    item = await asyncio.wait_for(
-                        self._pending.get(), timeout=remaining
+                    batch.append(
+                        await asyncio.wait_for(self._pending.get(), timeout=remaining)
                     )
-                    batch.append(item)
                 except asyncio.TimeoutError:
                     break
+            print(f"[SCHED] Dispatching batch of {len(batch)} request(s)", flush=True)
+            await self._loop.run_in_executor(None, self._generate_batch, batch)
 
-            print(
-                f"[SCHED] Dispatching batch of {len(batch)} request(s)",
-                flush=True,
-            )
+    # -- helpers called from the executor thread --
 
-            # Run generation in thread pool to avoid blocking the event loop
-            loop = self._loop
-            await loop.run_in_executor(None, self._generate_batch, batch)
+    def _enqueue(self, q: asyncio.Queue, item):
+        """Thread-safe put onto an asyncio.Queue."""
+        self._loop.call_soon_threadsafe(q.put_nowait, item)
 
     def _generate_batch(self, batch: list[_BatchItem]):
-        """Run batched generation in a thread. Dispatches PCM chunks to per-item queues."""
-        texts = [item.text for item in batch]
-        language = batch[0].language  # All items use the same language
-        voice_clone_prompts = [item.voice_clone_prompt for item in batch]
-        stop_events = [item.stop_event for item in batch]
-        ttfb_printed = [False] * len(batch)
-        sentinel_sent = [False] * len(batch)
-
-        def _send_sentinel(idx: int):
-            if sentinel_sent[idx]:
-                return
-            sentinel_sent[idx] = True
-            item = batch[idx]
-            gen_time = time.time() - item.start_time
-            print(
-                f"[GEN_DONE] PID={os.getpid()} {gen_time:.3f}s input: {item.text[:60]}",
-                flush=True,
-            )
-            try:
-                item.output_queue.put(_SENTINEL, timeout=1)
-            except queue.Full:
-                pass
-
+        finished = set()   # indices whose sentinel has already been sent
         try:
             if len(batch) == 1:
-                # Single request: use the original unbatched path for efficiency
-                item = batch[0]
-                try:
-                    for chunk, sr in self.model.stream_generate_voice_clone(
-                        text=item.text,
-                        language=item.language,
-                        voice_clone_prompt=item.voice_clone_prompt,
-                        emit_every_frames=4,
-                        decode_window_frames=80,
-                        overlap_samples=512,
-                    ):
-                        if item.stop_event.is_set():
-                            print(
-                                f"[CANCEL] PID={os.getpid()} client disconnected: {item.text[:60]}",
-                                flush=True,
-                            )
-                            break
-                        if not ttfb_printed[0]:
-                            ttfb = time.time() - item.start_time
-                            print(
-                                f"[TTFB] PID={os.getpid()} {ttfb:.3f}s input: {item.text[:60]}",
-                                flush=True,
-                            )
-                            ttfb_printed[0] = True
-                        chunk_int16 = np.clip(chunk, -1.0, 1.0)
-                        chunk_bytes = (chunk_int16 * 32767.0).astype(np.int16).tobytes()
-                        try:
-                            item.output_queue.put(chunk_bytes, timeout=5)
-                        except queue.Full:
-                            print(
-                                f"[CANCEL] PID={os.getpid()} queue full: {item.text[:60]}",
-                                flush=True,
-                            )
-                            break
-                finally:
-                    _send_sentinel(0)
+                self._generate_single(batch[0])
             else:
-                # Batched generation
-                finished = [False] * len(batch)
-                try:
-                    for results in self.model.batched_stream_generate_voice_clone(
-                        texts=texts,
-                        language=language,
-                        voice_clone_prompts=voice_clone_prompts,
-                        stop_events=stop_events,
-                        emit_every_frames=4,
-                        decode_window_frames=80,
-                        overlap_samples=512,
-                    ):
-                        for i, result in enumerate(results):
-                            if finished[i]:
-                                continue
-                            if result is None:
-                                continue
-                            chunk, sr = result
-                            item = batch[i]
-                            if not ttfb_printed[i]:
-                                ttfb = time.time() - item.start_time
-                                print(
-                                    f"[TTFB] PID={os.getpid()} {ttfb:.3f}s input: {item.text[:60]}",
-                                    flush=True,
-                                )
-                                ttfb_printed[i] = True
-                            chunk_int16 = np.clip(chunk, -1.0, 1.0)
-                            chunk_bytes = (chunk_int16 * 32767.0).astype(np.int16).tobytes()
-                            try:
-                                item.output_queue.put(chunk_bytes, timeout=5)
-                            except queue.Full:
-                                print(
-                                    f"[CANCEL] PID={os.getpid()} queue full: {item.text[:60]}",
-                                    flush=True,
-                                )
-                                item.stop_event.set()
-
-                        # Send sentinel immediately for items that just finished
-                        # (EOS or cancelled) so clients don't wait for the whole batch
-                        for i, item in enumerate(batch):
-                            if not finished[i] and item.stop_event.is_set():
-                                finished[i] = True
-                                _send_sentinel(i)
-                except Exception as e:
-                    print(f"[ERROR] PID={os.getpid()} Batch generation error: {e}", flush=True)
-                    traceback.print_exc()
-                finally:
-                    for i in range(len(batch)):
-                        _send_sentinel(i)
-
+                self._generate_batched(batch, finished)
         except Exception as e:
-            print(f"[ERROR] PID={os.getpid()} Fatal batch error: {e}", flush=True)
+            print(f"[ERROR] PID={os.getpid()} generation error: {e}", flush=True)
             traceback.print_exc()
-            for i in range(len(batch)):
-                _send_sentinel(i)
+        finally:
+            for i, item in enumerate(batch):
+                if i not in finished:
+                    t = time.time() - item.start_time
+                    print(f"[GEN_DONE] PID={os.getpid()} {t:.3f}s input: {item.text[:60]}", flush=True)
+                self._enqueue(item.output_queue, _SENTINEL)
+
+    def _generate_single(self, item: _BatchItem):
+        ttfb_printed = False
+        for chunk, sr in self.model.stream_generate_voice_clone(
+            text=item.text,
+            language=item.language,
+            voice_clone_prompt=item.voice_clone_prompt,
+            emit_every_frames=4,
+            decode_window_frames=80,
+            overlap_samples=512,
+        ):
+            if item.stop_event.is_set():
+                print(f"[CANCEL] PID={os.getpid()} client disconnected: {item.text[:60]}", flush=True)
+                break
+            if not ttfb_printed:
+                t = time.time() - item.start_time
+                print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {item.text[:60]}", flush=True)
+                ttfb_printed = True
+            self._enqueue(item.output_queue, chunk)
+
+    def _generate_batched(self, batch: list[_BatchItem], finished: set):
+        ttfb_printed = [False] * len(batch)
+        for results in self.model.batched_stream_generate_voice_clone(
+            texts=[it.text for it in batch],
+            language=batch[0].language,
+            voice_clone_prompts=[it.voice_clone_prompt for it in batch],
+            stop_events=[it.stop_event for it in batch],
+            emit_every_frames=4,
+            decode_window_frames=80,
+            overlap_samples=512,
+        ):
+            for i, result in enumerate(results):
+                if i in finished or result is None:
+                    continue
+                chunk, sr = result
+                if not ttfb_printed[i]:
+                    t = time.time() - batch[i].start_time
+                    print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
+                    ttfb_printed[i] = True
+                self._enqueue(batch[i].output_queue, chunk)
+
+            # Eagerly send sentinel for items that just finished (EOS / cancelled)
+            for i, item in enumerate(batch):
+                if i not in finished and item.stop_event.is_set():
+                    finished.add(i)
+                    t = time.time() - item.start_time
+                    print(f"[GEN_DONE] PID={os.getpid()} {t:.3f}s input: {item.text[:60]}", flush=True)
+                    self._enqueue(item.output_queue, _SENTINEL)
 
 
 scheduler = BatchScheduler(model, max_batch_size=MAX_BATCH_SIZE, max_wait_s=BATCH_WAIT_S)
@@ -368,13 +295,10 @@ async def add_voice(body: AddVoiceRequest):
         raise HTTPException(status_code=404, detail=f"File not found: {filepath}")
 
     try:
-        # Persist metadata to disk for cross-worker discovery
-        # Use basename to match _get_voice_clone_prompt's lookup key
         meta_path = os.path.join(VOICE_META_DIR, f"{os.path.basename(body.ref_audio_filename)}.json")
         with open(meta_path, "w") as f:
             json.dump({"ref_audio": filepath, "ref_text": body.ref_text}, f)
 
-        # Eagerly cache in THIS worker
         prompt = model.create_voice_clone_prompt(filepath, body.ref_text)
         VOICE_CLONE_CACHE[filepath] = prompt
 
@@ -395,27 +319,18 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
         if loaded is not None:
             voice_clone_prompt = loaded
 
-    print(
-        f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}",
-        flush=True,
-    )
+    print(f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}", flush=True)
 
     output_queue, stop_event = await scheduler.submit(text, language, voice_clone_prompt)
 
-    def audio_stream():
+    async def audio_stream():
         try:
             while True:
-                try:
-                    item = output_queue.get(timeout=30)
-                except queue.Empty:
-                    print(
-                        f"[TIMEOUT] PID={os.getpid()} no data for 30s, aborting: {text[:60]}",
-                        flush=True,
-                    )
+                chunk = await output_queue.get()
+                if chunk is _SENTINEL:
                     break
-                if item is _SENTINEL:
-                    break
-                yield item
+                pcm = np.clip(chunk, -1.0, 1.0)
+                yield (pcm * 32767.0).astype(np.int16).tobytes()
         finally:
             stop_event.set()
 

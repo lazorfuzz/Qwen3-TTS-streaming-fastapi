@@ -106,6 +106,14 @@ stderr_logfile_maxbytes=0
 ${WORKERS}
 EOF
 
+export CUDA_VISIBLE_DEVICES=0
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
+
+mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
+
+nvidia-cuda-mps-control -d
+
 echo "[entrypoint_local] Generated configs in ${LOCAL_RUN_DIR}/"
 echo "[entrypoint_local] Starting supervisord..."
 
