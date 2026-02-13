@@ -76,10 +76,11 @@ model.enable_streaming_optimizations(
 VOICE_CLONE_CACHE = {}
 
 # Pre-build default voice at startup
+# create_voice_clone_prompt returns List[VoiceClonePromptItem]; store the single item
 VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH] = model.create_voice_clone_prompt(
     ref_audio=DEFAULT_VOICE_CLONE_REF_PATH,
     ref_text=DEFAULT_TEXT,
-)
+)[0]
 
 print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
 
@@ -96,7 +97,7 @@ print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
 # pre-compiles the hot paths so real requests run at full speed.
 
 WARMUP_TEXT = "Warmup sentence for torch compile."
-_default_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
+_default_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]  # VoiceClonePromptItem
 
 print(f"[WARMUP] Compiling for batch_size=1...", flush=True)
 for _ in model.stream_generate_voice_clone(
@@ -309,7 +310,7 @@ def _get_voice_clone_prompt(filepath: str):
     with open(meta_path, "r") as f:
         meta = json.load(f)
 
-    prompt = model.create_voice_clone_prompt(meta["ref_audio"], meta["ref_text"])
+    prompt = model.create_voice_clone_prompt(meta["ref_audio"], meta["ref_text"])[0]
     VOICE_CLONE_CACHE[filepath] = prompt
     return prompt
 
@@ -347,7 +348,7 @@ async def add_voice(body: AddVoiceRequest):
         with open(meta_path, "w") as f:
             json.dump({"ref_audio": filepath, "ref_text": body.ref_text}, f)
 
-        prompt = model.create_voice_clone_prompt(filepath, body.ref_text)
+        prompt = model.create_voice_clone_prompt(filepath, body.ref_text)[0]
         VOICE_CLONE_CACHE[filepath] = prompt
 
         return {"status": "success", "message": f"Voice added: {body.ref_audio_filename}"}
