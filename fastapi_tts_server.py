@@ -27,8 +27,14 @@ from pydantic import BaseModel
 from qwen_tts import Qwen3TTSModel
 import time
 import torch
+import torch._dynamo
 from typing import Optional
 from dataclasses import dataclass
+
+# Increase recompile limit: the talker forward has many calling patterns
+# (prefill vs decode, different kwargs combos, different batch sizes).
+# Default limit of 8 causes permanent fallback to eager mode.
+torch._dynamo.config.recompile_limit = 64
 
 _SENTINEL = object()
 
@@ -76,6 +82,48 @@ VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH] = model.create_voice_clone_promp
 )
 
 print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Warmup: pre-compile torch.compile for single and batched inference
+# ---------------------------------------------------------------------------
+# torch.compile compiles lazily on first call. Without warmup, the first
+# real request triggers compilation (very slow). Worse, batch_size changes
+# trigger recompilation — if the recompile limit is hit, torch.compile falls
+# back to eager mode permanently (much slower).
+#
+# Running warmup inference for batch_size=1 and batch_size=MAX_BATCH_SIZE
+# pre-compiles the hot paths so real requests run at full speed.
+
+WARMUP_TEXT = "Warmup sentence for torch compile."
+_default_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
+
+print(f"[WARMUP] Compiling for batch_size=1...", flush=True)
+for _ in model.stream_generate_voice_clone(
+    text=WARMUP_TEXT,
+    language="English",
+    voice_clone_prompt=_default_prompt,
+    emit_every_frames=4,
+    decode_window_frames=80,
+    overlap_samples=512,
+):
+    pass
+
+if MAX_BATCH_SIZE > 1:
+    print(f"[WARMUP] Compiling for batch_size={MAX_BATCH_SIZE}...", flush=True)
+    _warmup_stops = [threading.Event() for _ in range(MAX_BATCH_SIZE)]
+    for _ in model.batched_stream_generate_voice_clone(
+        texts=[WARMUP_TEXT] * MAX_BATCH_SIZE,
+        language="English",
+        voice_clone_prompts=[_default_prompt] * MAX_BATCH_SIZE,
+        stop_events=_warmup_stops,
+        emit_every_frames=4,
+        decode_window_frames=80,
+        overlap_samples=512,
+    ):
+        pass
+
+print(f"[WARMUP] Compilation warmup complete (PID={os.getpid()}).", flush=True)
 
 
 # ---------------------------------------------------------------------------
