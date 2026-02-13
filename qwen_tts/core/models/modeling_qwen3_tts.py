@@ -16,6 +16,7 @@
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Callable, Optional, Generator
 
@@ -2859,6 +2860,328 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Debug removed for performance: flush done
             yield wav, sr
+
+    @torch.inference_mode()
+    def batched_stream_generate_pcm(
+        self,
+        input_ids: list[torch.Tensor],
+        ref_ids: list[Optional[torch.Tensor]],
+        voice_clone_prompt: dict,
+        languages: list[str],
+        stop_events: list[threading.Event],
+        non_streaming_mode: bool = False,
+        # Sampling parameters for first codebook
+        do_sample: bool = True,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        temperature: float = 0.9,
+        # Sub-talker parameters (for remaining code groups)
+        subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50,
+        subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 0,
+        max_frames: int = 10000,
+        use_optimized_decode: bool = True,
+    ) -> Generator[list[Optional[tuple[np.ndarray, int]]], None, None]:
+        """
+        Batched streaming audio generation, yielding per-item PCM chunks.
+
+        Runs a single batched forward pass for all items in the batch, tracking
+        per-item EOS and cancellation. Items that finish early are marked inactive
+        but remain in the batch tensor (their outputs are discarded).
+
+        Args:
+            input_ids: List of input token tensors (one per batch item)
+            ref_ids: List of optional reference token tensors (one per batch item)
+            voice_clone_prompt: Batched voice clone prompt dict (each value is a list)
+            languages: List of language strings (one per batch item)
+            stop_events: List of threading.Event for per-item cancellation
+            non_streaming_mode: Whether to use non-streaming text mode
+            do_sample, top_k, top_p, temperature: Sampling params for first codebook
+            subtalker_*: Parameters for sub-codebook prediction
+            emit_every_frames: Emit PCM chunk every N codec frames
+            decode_window_frames: Window size for decoding
+            overlap_samples: Overlap samples for crossfade between chunks
+            max_frames: Maximum number of codec frames to generate
+            use_optimized_decode: Use optimized decode path when available
+
+        Yields:
+            list[Optional[tuple[np.ndarray, int]]]: One entry per batch item.
+                Active items get (pcm_chunk, sample_rate), finished items get None.
+        """
+        batch_size = len(input_ids)
+
+        # Build talker inputs (handles left-padding + attention mask for variable lengths)
+        talker_input_embeds, talker_attention_mask, trailing_text_hiddens, tts_pad_embed = \
+            self._build_talker_inputs(
+                input_ids=input_ids,
+                instruct_ids=None,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_clone_prompt,
+                languages=languages,
+                speakers=None,
+                non_streaming_mode=non_streaming_mode,
+            )
+
+        eos_id = self.config.talker_config.codec_eos_token_id
+        vocab_size = self.config.talker_config.vocab_size
+        suppress_tokens = [
+            i for i in range(vocab_size - 1024, vocab_size)
+            if i != eos_id
+        ]
+
+        # --- Prefill phase ---
+        torch.compiler.cudagraph_mark_step_begin()
+
+        out = self.talker.forward(
+            inputs_embeds=talker_input_embeds,
+            attention_mask=talker_attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=trailing_text_hiddens,
+            tts_pad_embed=tts_pad_embed,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+            subtalker_dosample=subtalker_dosample,
+            subtalker_top_k=subtalker_top_k,
+            subtalker_top_p=subtalker_top_p,
+            subtalker_temperature=subtalker_temperature,
+        )
+
+        past_key_values = out.past_key_values
+        past_hidden = out.past_hidden
+        generation_step = out.generation_step
+
+        # Sample first token from prefill logits
+        last_logits = out.logits[:, -1, :]
+        if do_sample:
+            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
+        else:
+            token = torch.argmax(last_logits, dim=-1)
+
+        # --- Per-item state ---
+        active = [True] * batch_size
+        codes_buffers: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        decoded_tails: list[Optional[np.ndarray]] = [None] * batch_size
+        total_frames_emitted = [0] * batch_size
+        frames_since_emit = 0
+
+        # Extract per-item ref_code context for decoder (ICL mode)
+        ref_code_contexts: list[Optional[torch.Tensor]] = [None] * batch_size
+        ref_code_frames_list: list[int] = [0] * batch_size
+        if voice_clone_prompt is not None:
+            ref_code_list = voice_clone_prompt.get("ref_code", None)
+            icl_mode_list = voice_clone_prompt.get("icl_mode", None)
+            if ref_code_list is not None and icl_mode_list is not None:
+                for i in range(batch_size):
+                    if ref_code_list[i] is not None and icl_mode_list[i]:
+                        ref_code_contexts[i] = ref_code_list[i].to(self.talker.device)
+                        ref_code_frames_list[i] = ref_code_contexts[i].shape[0]
+
+        # --- Autoregressive loop ---
+        for step_idx in range(max_frames):
+            torch.compiler.cudagraph_mark_step_begin()
+
+            step_out = self.talker.forward(
+                input_ids=token.unsqueeze(1),  # [B, 1]
+                use_cache=True,
+                return_dict=True,
+                output_hidden_states=False,
+                past_key_values=past_key_values,
+                past_hidden=past_hidden,
+                generation_step=generation_step,
+                trailing_text_hidden=trailing_text_hiddens,
+                tts_pad_embed=tts_pad_embed,
+                subtalker_dosample=subtalker_dosample,
+                subtalker_top_k=subtalker_top_k,
+                subtalker_top_p=subtalker_top_p,
+                subtalker_temperature=subtalker_temperature,
+            )
+
+            past_key_values = step_out.past_key_values
+            past_hidden = step_out.past_hidden
+            generation_step = step_out.generation_step
+
+            codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
+
+            # Per-item EOS + cancellation check
+            newly_finished = []
+            for i in range(batch_size):
+                if not active[i]:
+                    continue
+                if codec_ids[i, 0] == eos_id or stop_events[i].is_set():
+                    active[i] = False
+                    newly_finished.append(i)
+                    # Signal completion so the server can send sentinel immediately
+                    stop_events[i].set()
+                else:
+                    codes_buffers[i].append(codec_ids[i].detach())
+
+            if not any(active) and not newly_finished:
+                break
+
+            # Sample next token (batched)
+            step_logits = step_out.logits[:, -1, :]
+            if do_sample:
+                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+            else:
+                token = torch.argmax(step_logits, dim=-1)
+
+            frames_since_emit += 1
+            need_emit = frames_since_emit >= emit_every_frames
+            need_flush = len(newly_finished) > 0
+
+            if not need_emit and not need_flush:
+                if not any(active):
+                    # All done, but we need to flush below
+                    pass
+                else:
+                    continue
+
+            results: list[Optional[tuple[np.ndarray, int]]] = [None] * batch_size
+            samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
+
+            # Emit regular chunks for active items
+            if need_emit:
+                frames_since_emit = 0
+                for i in range(batch_size):
+                    if not active[i] or len(codes_buffers[i]) == 0:
+                        continue
+                    results[i] = self._decode_item_chunk(
+                        i, codes_buffers[i], decoded_tails, total_frames_emitted,
+                        ref_code_contexts[i], ref_code_frames_list[i],
+                        decode_window_frames, emit_every_frames, overlap_samples,
+                        samples_per_frame, use_optimized_decode,
+                    )
+
+            # Flush finished items
+            for i in newly_finished:
+                flush_result = self._flush_item(
+                    i, codes_buffers[i], decoded_tails, total_frames_emitted,
+                    ref_code_contexts[i], ref_code_frames_list[i],
+                    decode_window_frames, overlap_samples, use_optimized_decode,
+                )
+                if flush_result is not None:
+                    results[i] = flush_result
+
+            # Only yield if there's something to report
+            if any(r is not None for r in results):
+                yield results
+
+            if not any(active):
+                break
+
+        # Final flush for any items that hit max_frames without EOS
+        final_results: list[Optional[tuple[np.ndarray, int]]] = [None] * batch_size
+        any_flushed = False
+        for i in range(batch_size):
+            if active[i]:
+                stop_events[i].set()  # Signal completion
+                if len(codes_buffers[i]) > total_frames_emitted[i]:
+                    flush_result = self._flush_item(
+                        i, codes_buffers[i], decoded_tails, total_frames_emitted,
+                        ref_code_contexts[i], ref_code_frames_list[i],
+                        decode_window_frames, overlap_samples, use_optimized_decode,
+                    )
+                    if flush_result is not None:
+                        final_results[i] = flush_result
+                        any_flushed = True
+        if any_flushed:
+            yield final_results
+
+    def _decode_item_chunk(
+        self,
+        item_idx: int,
+        codes_buffer: list[torch.Tensor],
+        decoded_tails: list[Optional[np.ndarray]],
+        total_frames_emitted: list[int],
+        ref_code_context: Optional[torch.Tensor],
+        ref_code_frames: int,
+        decode_window_frames: int,
+        emit_every_frames: int,
+        overlap_samples: int,
+        samples_per_frame: int,
+        use_optimized_decode: bool,
+    ) -> tuple[np.ndarray, int]:
+        """Decode a regular streaming chunk for a single batch item."""
+        start = max(0, len(codes_buffer) - decode_window_frames)
+        window_codes = torch.stack(codes_buffer[start:], dim=0)
+
+        window, _ = _add_ref_code_context(
+            window_codes, ref_code_context, ref_code_frames, decode_window_frames
+        )
+
+        if use_optimized_decode and hasattr(self.speech_tokenizer, 'decode_streaming'):
+            wavs, sr = self.speech_tokenizer.decode_streaming(
+                window.to(self.talker.device),
+                use_optimized=True,
+                pad_to_size=decode_window_frames,
+            )
+        else:
+            wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+
+        wav = wavs[0].astype(np.float32)
+        step_samples = samples_per_frame * emit_every_frames
+        chunk = wav[-step_samples:] if step_samples > 0 else wav
+
+        if decoded_tails[item_idx] is not None and overlap_samples > 0:
+            ov = min(overlap_samples, len(decoded_tails[item_idx]), len(chunk))
+            if ov > 0:
+                head = _crossfade(decoded_tails[item_idx][-ov:], chunk[:ov])
+                chunk = np.concatenate([head, chunk[ov:]], axis=0)
+
+        decoded_tails[item_idx] = chunk.copy()
+        total_frames_emitted[item_idx] = len(codes_buffer)
+        return chunk, sr
+
+    def _flush_item(
+        self,
+        item_idx: int,
+        codes_buffer: list[torch.Tensor],
+        decoded_tails: list[Optional[np.ndarray]],
+        total_frames_emitted: list[int],
+        ref_code_context: Optional[torch.Tensor],
+        ref_code_frames: int,
+        decode_window_frames: int,
+        overlap_samples: int,
+        use_optimized_decode: bool,
+    ) -> Optional[tuple[np.ndarray, int]]:
+        """Flush remaining un-emitted frames for a finished batch item."""
+        remaining_frames = len(codes_buffer) - total_frames_emitted[item_idx]
+        if remaining_frames <= 0:
+            return None
+
+        context_frames = min(total_frames_emitted[item_idx], decode_window_frames - remaining_frames)
+        start_idx = total_frames_emitted[item_idx] - context_frames
+        window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
+
+        window, flush_ref_prefix_frames = _add_ref_code_context(
+            window_codes, ref_code_context, ref_code_frames, decode_window_frames
+        )
+
+        wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+        wav = wavs[0].astype(np.float32)
+
+        skip_frames = flush_ref_prefix_frames + context_frames
+        if skip_frames > 0:
+            spf = len(wav) / window.shape[0]
+            skip_samples = int(skip_frames * spf)
+            wav = wav[skip_samples:]
+
+        if decoded_tails[item_idx] is not None and overlap_samples > 0 and len(wav) > 0:
+            ov = min(overlap_samples, len(decoded_tails[item_idx]), len(wav))
+            if ov > 0:
+                head = _crossfade(decoded_tails[item_idx][-ov:], wav[:ov])
+                wav = np.concatenate([head, wav[ov:]], axis=0)
+
+        total_frames_emitted[item_idx] = len(codes_buffer)
+        return wav, sr
 
 
 __all__ = [

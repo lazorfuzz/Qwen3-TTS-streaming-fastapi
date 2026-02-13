@@ -1,10 +1,19 @@
 #!/bin/bash
 set -e
 
-NUM_WORKERS=${TTS_NUM_WORKERS:-2}
+NUM_WORKERS=${TTS_NUM_WORKERS:-1}
 BASE_PORT=8001
 
 echo "[entrypoint] Starting with ${NUM_WORKERS} worker(s)..."
+
+# Single worker: run uvicorn directly on port 8000 (no nginx needed)
+if [ "$NUM_WORKERS" -eq 1 ]; then
+    echo "[entrypoint] Single worker mode — binding uvicorn directly to :8000"
+    exec uvicorn fastapi_tts_server:app --host 0.0.0.0 --port 8000
+fi
+
+# Multi-worker: use nginx + supervisord
+echo "[entrypoint] Multi-worker mode — using nginx load balancer"
 
 # Generate nginx upstream servers
 UPSTREAM=""

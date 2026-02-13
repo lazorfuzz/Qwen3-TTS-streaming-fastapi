@@ -57,9 +57,11 @@ RUN chmod +x /app/entrypoint.sh
 RUN mkdir -p /app/voices
 
 # Default env vars
-ENV TTS_NUM_WORKERS=2
+ENV TTS_NUM_WORKERS=1
 ENV TTS_VOICE_META_DIR=/app/voices
 ENV TTS_API_KEY=""
+ENV TTS_MAX_BATCH_SIZE=8
+ENV TTS_BATCH_WAIT_MS=50
 
 # Expose port
 EXPOSE 8000

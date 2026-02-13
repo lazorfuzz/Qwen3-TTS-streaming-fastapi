@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-NUM_WORKERS=${TTS_NUM_WORKERS:-2}
+NUM_WORKERS=${TTS_NUM_WORKERS:-1}
 BASE_PORT=8001
 WORK_DIR="$(pwd)"
 LOCAL_RUN_DIR="${WORK_DIR}/.run"
@@ -9,6 +9,15 @@ export TTS_VOICE_META_DIR="${TTS_VOICE_META_DIR:-${WORK_DIR}/voices}"
 
 echo "[entrypoint_local] Working directory: ${WORK_DIR}"
 echo "[entrypoint_local] Starting with ${NUM_WORKERS} worker(s)..."
+
+# Single worker: run uvicorn directly on port 8000 (no nginx needed)
+if [ "$NUM_WORKERS" -eq 1 ]; then
+    echo "[entrypoint_local] Single worker mode — binding uvicorn directly to :8000"
+    exec uvicorn fastapi_tts_server:app --host 0.0.0.0 --port 8000
+fi
+
+# Multi-worker: use nginx + supervisord
+echo "[entrypoint_local] Multi-worker mode — using nginx load balancer"
 
 # Create local runtime dirs for nginx (avoids writing to /var or /etc)
 mkdir -p "${LOCAL_RUN_DIR}/nginx" "${LOCAL_RUN_DIR}/logs"
