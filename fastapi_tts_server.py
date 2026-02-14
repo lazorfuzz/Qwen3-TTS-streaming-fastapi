@@ -259,6 +259,9 @@ class BatchScheduler:
             for i, result in enumerate(results):
                 if i in finished or result is None:
                     continue
+                if not isinstance(result, tuple):
+                    print(f"[WARN] PID={os.getpid()} unexpected result type for item {i}: {type(result).__name__}={result}", flush=True)
+                    continue
                 chunk, sr = result
                 if not ttfb_printed[i]:
                     t = time.time() - batch[i].start_time
