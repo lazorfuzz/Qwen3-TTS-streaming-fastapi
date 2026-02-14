@@ -256,18 +256,20 @@ class BatchScheduler:
             decode_window_frames=80,
             overlap_samples=512,
         ):
-            for i, result in enumerate(results):
-                if i in finished or result is None:
-                    continue
-                if not isinstance(result, tuple):
-                    print(f"[WARN] PID={os.getpid()} unexpected result type for item {i}: {type(result).__name__}={result}", flush=True)
-                    continue
-                chunk, sr = result
-                if not ttfb_printed[i]:
-                    t = time.time() - batch[i].start_time
-                    print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
-                    ttfb_printed[i] = True
-                self._enqueue(batch[i].output_queue, chunk)
+            if (isinstance(results, (tuple, list))
+                    and len(results) == 3
+                    and isinstance(results[0], (int, np.integer))):
+                # Format A: per-item yield
+                i, chunk, sr = results
+                if i not in finished:
+                    if not ttfb_printed[i]:
+                        t = time.time() - batch[i].start_time
+                        print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
+                        ttfb_printed[i] = True
+                    self._enqueue(batch[i].output_queue, chunk)
+            else:
+                print(f"[WARN] PID={os.getpid()} unexpected result type for item {i}: {type(results).__name__}={results}", flush=True)
+                continue
 
             # Eagerly send sentinel for items that just finished (EOS / cancelled)
             for i, item in enumerate(batch):
