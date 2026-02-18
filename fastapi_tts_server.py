@@ -67,7 +67,7 @@ model.enable_streaming_optimizations(
     decode_window_frames=80,
     use_compile=True,
     use_cuda_graphs=False,
-    compile_mode="max-autotune-no-cudagraphs",
+    compile_mode="reduce-overhead",
     use_fast_codebook=True,
     compile_codebook_predictor=True,
     compile_talker=True,
@@ -260,7 +260,7 @@ class BatchScheduler:
             if (isinstance(results, (tuple, list))
                     and len(results) == 3
                     and isinstance(results[0], (int, np.integer))):
-                # Format A: per-item yield
+                # Format A: per-item yield  (i, chunk, sr)
                 i, chunk, sr = results
                 if i not in finished:
                     if not ttfb_printed[i]:
@@ -268,6 +268,17 @@ class BatchScheduler:
                         print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
                         ttfb_printed[i] = True
                     self._enqueue(batch[i].output_queue, chunk)
+            elif (isinstance(results, list)
+                    and len(results) > 0
+                    and isinstance(results[0], tuple)):
+                # Format B: list of (chunk, sr) tuples, one per batch item
+                for i, (chunk, sr) in enumerate(results):
+                    if i not in finished:
+                        if not ttfb_printed[i]:
+                            t = time.time() - batch[i].start_time
+                            print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
+                            ttfb_printed[i] = True
+                        self._enqueue(batch[i].output_queue, chunk)
             else:
                 print(f"[WARN] PID={os.getpid()} unexpected result type: {type(results).__name__}={results}", flush=True)
                 continue
