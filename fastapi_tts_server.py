@@ -35,6 +35,7 @@ from dataclasses import dataclass
 # (prefill vs decode, different kwargs combos, different batch sizes).
 # Default limit of 8 causes permanent fallback to eager mode.
 torch._dynamo.config.recompile_limit = 64
+torch.set_float32_matmul_precision('high')
 
 _SENTINEL = object()
 
@@ -268,7 +269,7 @@ class BatchScheduler:
                         ttfb_printed[i] = True
                     self._enqueue(batch[i].output_queue, chunk)
             else:
-                print(f"[WARN] PID={os.getpid()} unexpected result type for item {i}: {type(results).__name__}={results}", flush=True)
+                print(f"[WARN] PID={os.getpid()} unexpected result type: {type(results).__name__}={results}", flush=True)
                 continue
 
             # Eagerly send sentinel for items that just finished (EOS / cancelled)
