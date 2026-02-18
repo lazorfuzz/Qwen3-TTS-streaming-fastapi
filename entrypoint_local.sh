@@ -112,7 +112,9 @@ export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
 
 mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
 
-nvidia-cuda-mps-control -d
+if ! nvidia-cuda-mps-control -d 2>/dev/null; then
+    echo "[entrypoint_local] MPS daemon already running or unavailable — skipping"
+fi
 
 echo "[entrypoint_local] Generated configs in ${LOCAL_RUN_DIR}/"
 echo "[entrypoint_local] Starting supervisord..."
