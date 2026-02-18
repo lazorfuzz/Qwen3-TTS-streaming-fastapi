@@ -67,7 +67,7 @@ model.enable_streaming_optimizations(
     decode_window_frames=80,
     use_compile=True,
     use_cuda_graphs=False,
-    compile_mode="reduce-overhead",
+    compile_mode="max-autotune-no-cudagraphs",
     use_fast_codebook=True,
     compile_codebook_predictor=True,
     compile_talker=True,
