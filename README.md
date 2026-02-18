@@ -28,7 +28,7 @@ The server exposes an OpenAI-compatible `POST /v1/audio/speech` endpoint that st
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TTS_NUM_WORKERS` | `2` | Number of uvicorn worker processes |
+| `TTS_NUM_WORKERS` | `2` | Number of uvicorn worker processes. Set to `auto` to match the number of NVIDIA MIG instances. |
 | `TTS_VOICE_META_DIR` | `/app/voices` (Docker), `./voices` (local) | Directory for voice metadata JSON files |
 | `TTS_API_KEY` | (empty) | Optional API key for Bearer auth on `/v1/*` endpoints. Unset/empty disables auth. |
 
@@ -41,6 +41,12 @@ docker build --network=host -t qwen3-tts-server .
 docker run --gpus all -p 8000:8000 -v $(pwd):/app -v $(pwd)/hf_cache:/root/.cache/huggingface --network=host qwen3-tts-server
 ```
 
+MIG is also supported in Docker — pass `TTS_NUM_WORKERS=auto` and expose MIG devices via `--gpus`:
+
+```bash
+docker run --gpus all -e TTS_NUM_WORKERS=auto -p 8000:8000 -v $(pwd):/app -v $(pwd)/hf_cache:/root/.cache/huggingface --network=host qwen3-tts-server
+```
+
 ### Option B: Directly on a VM (no Docker, no sudo)
 
 Uses `entrypoint_local.sh`, which generates nginx and supervisord configs in a local `.run/` directory and does not require root.
@@ -51,6 +57,20 @@ Prerequisites: `nginx`, `supervisord`, `uvicorn`, and Python dependencies instal
 pip install -e .
 TTS_NUM_WORKERS=2 ./entrypoint_local.sh
 ```
+
+#### NVIDIA MIG support
+
+On GPUs that support Multi-Instance GPU (e.g. A100), you can partition the GPU into isolated slices and run one worker per slice. Create the MIG instances first, then use `auto`:
+
+```bash
+# Create 7 MIG instances (1g.10gb each on an A100 80GB)
+sudo nvidia-smi mig -cgi 19,19,19,19,19,19,19 -C
+
+# Start with one worker per MIG slice (auto-detected)
+TTS_NUM_WORKERS=auto ./entrypoint_local.sh
+```
+
+Each worker gets its own `CUDA_VISIBLE_DEVICES` set to the MIG device UUID, providing hardware-level memory and compute isolation without MPS.
 
 ### Testing
 
