@@ -274,17 +274,18 @@ class BatchScheduler:
                         print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
                         ttfb_printed[i] = True
                     self._enqueue(batch[i].output_queue, chunk)
-            elif (isinstance(results, list)
-                    and len(results) > 0
-                    and isinstance(results[0], tuple)):
-                # Format B: list of (chunk, sr) tuples, one per batch item
-                for i, (chunk, sr) in enumerate(results):
-                    if i not in finished:
-                        if not ttfb_printed[i]:
-                            t = time.time() - batch[i].start_time
-                            print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
-                            ttfb_printed[i] = True
-                        self._enqueue(batch[i].output_queue, chunk)
+            elif isinstance(results, list) and len(results) > 0:
+                # Format B: list with one entry per batch item.
+                # Each entry is (chunk, sr) or None (no new audio this step).
+                for i, item_result in enumerate(results):
+                    if item_result is None or i in finished:
+                        continue
+                    chunk, sr = item_result
+                    if not ttfb_printed[i]:
+                        t = time.time() - batch[i].start_time
+                        print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {batch[i].text[:60]}", flush=True)
+                        ttfb_printed[i] = True
+                    self._enqueue(batch[i].output_queue, chunk)
             else:
                 print(f"[WARN] PID={os.getpid()} unexpected result type: {type(results).__name__}={results}", flush=True)
                 continue
