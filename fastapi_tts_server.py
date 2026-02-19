@@ -202,7 +202,13 @@ class BatchScheduler:
                 except asyncio.TimeoutError:
                     break
             print(f"[SCHED] Dispatching batch of {len(batch)} request(s)", flush=True)
-            await self._loop.run_in_executor(None, self._generate_batch, batch)
+            try:
+                await self._loop.run_in_executor(None, self._generate_batch, batch)
+            except Exception as e:
+                print(f"[SCHED_ERROR] PID={os.getpid()} executor failed: {e}", flush=True)
+                traceback.print_exc()
+                for item in batch:
+                    self._enqueue(item.output_queue, _SENTINEL)
 
     # -- helpers called from the executor thread --
 
