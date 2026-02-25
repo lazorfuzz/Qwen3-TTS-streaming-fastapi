@@ -346,6 +346,7 @@ def _get_voice_clone_prompt(filepath: str):
 class SpeechRequest(BaseModel):
     input: str
     cloning_audio_filename: Optional[str] = None
+    language_id: Optional[str] = None
 
 
 class AddVoiceRequest(BaseModel):
@@ -383,7 +384,7 @@ async def add_voice(body: AddVoiceRequest):
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
 async def speech_endpoint(request: Request, body: SpeechRequest):
     text = body.input
-    language = "English"
+    language = body.language_id if body.language_id else "auto"
 
     voice_clone_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
     if body.cloning_audio_filename:
