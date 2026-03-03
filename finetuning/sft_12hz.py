@@ -39,6 +39,8 @@ def train():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--language", type=str, default=None)
+    parser.add_argument("--language_id", type=int, default=None)
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -52,9 +54,19 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
+    language_id = None
+    if args.language:
+        codec_language_id = getattr(config.talker_config, 'codec_language_id', None) or {}
+        if args.language in codec_language_id:
+            language_id = codec_language_id[args.language]
+        elif args.language_id is not None:
+            language_id = args.language_id
+        else:
+            raise ValueError(f"Language '{args.language}' not found in model config and --language_id not provided")
+
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    dataset = TTSDataset(train_data, qwen3tts.processor, config, language_id=language_id)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -78,6 +90,7 @@ def train():
                 attention_mask = batch['attention_mask']
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
+                spk_pos = batch['spk_pos']
 
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
                 if target_speaker_embedding is None:
@@ -88,7 +101,7 @@ def train():
 
                 input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                input_codec_embedding[:, spk_pos, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -139,6 +152,10 @@ def train():
             talker_config["spk_is_dialect"] = {
                 args.speaker_name: False
             }
+            if args.language and language_id is not None:
+                codec_language_id_map = talker_config.get("codec_language_id", {})
+                codec_language_id_map[args.language] = language_id
+                talker_config["codec_language_id"] = codec_language_id_map
             config_dict["talker_config"] = talker_config
 
             with open(output_config_file, 'w', encoding='utf-8') as f:
