@@ -41,6 +41,7 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--language", type=str, default=None)
     parser.add_argument("--language_id", type=int, default=None)
+    parser.add_argument("--freeze_layers", type=int, default=0, help="Freeze the bottom N transformer layers of the talker")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -64,12 +65,22 @@ def train():
         else:
             raise ValueError(f"Language '{args.language}' not found in model config and --language_id not provided")
 
+    if args.freeze_layers > 0:
+        for param in qwen3tts.model.parameters():
+            param.requires_grad = True
+        for i in range(args.freeze_layers):
+            for param in qwen3tts.model.talker.model.layers[i].parameters():
+                param.requires_grad = False
+        total = sum(p.numel() for p in qwen3tts.model.parameters())
+        trainable = sum(p.numel() for p in qwen3tts.model.parameters() if p.requires_grad)
+        print(f"[FREEZE] Froze bottom {args.freeze_layers} talker layers. Trainable: {trainable:,} / {total:,} params")
+
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
     dataset = TTSDataset(train_data, qwen3tts.processor, config, language_id=language_id)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(filter(lambda p: p.requires_grad, qwen3tts.model.parameters()), lr=args.lr, weight_decay=0.01)
 
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader

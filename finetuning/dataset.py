@@ -43,7 +43,7 @@ class TTSDataset(Dataset):
     
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         
-        audio, sr = librosa.load(x, sr=None, mono=True)
+        audio, sr = librosa.load(x, sr=24000, mono=True)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
