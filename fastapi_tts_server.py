@@ -107,7 +107,7 @@ for _ in model.stream_generate_voice_clone(
     voice_clone_prompt=_default_prompt,
     emit_every_frames=4,
     decode_window_frames=80,
-    overlap_samples=512,
+    overlap_samples=0,
 ):
     pass
 
@@ -121,7 +121,7 @@ if MAX_BATCH_SIZE > 1:
         stop_events=_warmup_stops,
         emit_every_frames=4,
         decode_window_frames=80,
-        overlap_samples=512,
+        overlap_samples=0,
     ):
         pass
 
@@ -241,7 +241,7 @@ class BatchScheduler:
             voice_clone_prompt=item.voice_clone_prompt,
             emit_every_frames=4,
             decode_window_frames=80,
-            overlap_samples=512,
+            overlap_samples=0,
         ):
             if item.stop_event.is_set():
                 print(f"[CANCEL] PID={os.getpid()} client disconnected: {item.text[:60]}", flush=True)
@@ -261,7 +261,7 @@ class BatchScheduler:
             stop_events=[it.stop_event for it in batch],
             emit_every_frames=4,
             decode_window_frames=80,
-            overlap_samples=512,
+            overlap_samples=0,
         ):
             if (isinstance(results, (tuple, list))
                     and len(results) == 3
