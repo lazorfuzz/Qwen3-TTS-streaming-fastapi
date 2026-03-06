@@ -2826,7 +2826,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             decoded_tail = chunk.copy()
             total_frames_emitted = len(codes_buffer)  # Mark these frames as emitted
-            yield chunk, sr
+            # Hold back tail that will be crossfaded into the next chunk
+            # so the boundary region is only heard once (in the blend)
+            if overlap_samples > 0 and len(chunk) > overlap_samples:
+                yield chunk[:-overlap_samples], sr
+            else:
+                yield chunk, sr
 
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
@@ -2860,6 +2865,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Debug removed for performance: flush done
             yield wav, sr
+        elif overlap_samples > 0 and decoded_tail is not None:
+            # No remaining frames to flush, but we held back tail samples
+            ov = min(overlap_samples, len(decoded_tail))
+            yield decoded_tail[-ov:], self.speech_tokenizer.get_output_sample_rate()
 
     @torch.inference_mode()
     def batched_stream_generate_pcm(
@@ -3069,6 +3078,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 )
                 if flush_result is not None:
                     results[i] = flush_result
+                elif overlap_samples > 0 and decoded_tails[i] is not None:
+                    # No remaining frames to flush, yield held-back tail
+                    ov = min(overlap_samples, len(decoded_tails[i]))
+                    results[i] = (decoded_tails[i][-ov:], self.speech_tokenizer.get_output_sample_rate())
 
             # Only yield if there's something to report
             if any(r is not None for r in results):
@@ -3092,6 +3105,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     if flush_result is not None:
                         final_results[i] = flush_result
                         any_flushed = True
+                elif overlap_samples > 0 and decoded_tails[i] is not None:
+                    # No remaining frames, yield held-back tail
+                    ov = min(overlap_samples, len(decoded_tails[i]))
+                    final_results[i] = (decoded_tails[i][-ov:], self.speech_tokenizer.get_output_sample_rate())
+                    any_flushed = True
         if any_flushed:
             yield final_results
 
@@ -3138,6 +3156,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         decoded_tails[item_idx] = chunk.copy()
         total_frames_emitted[item_idx] = len(codes_buffer)
+        # Hold back tail that will be crossfaded into the next chunk
+        if overlap_samples > 0 and len(chunk) > overlap_samples:
+            return chunk[:-overlap_samples], sr
         return chunk, sr
 
     def _flush_item(
