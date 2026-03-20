@@ -3,6 +3,11 @@ set -e
 
 BASE_PORT=8001
 WORK_DIR="$(pwd)"
+
+# --- Prometheus multiprocess metrics ---
+export PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_metrics
+rm -rf "$PROMETHEUS_MULTIPROC_DIR"
+mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
 LOCAL_RUN_DIR="${WORK_DIR}/.run"
 export TTS_VOICE_META_DIR="${TTS_VOICE_META_DIR:-${WORK_DIR}/voices}"
 

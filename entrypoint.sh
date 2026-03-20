@@ -3,6 +3,11 @@ set -e
 
 BASE_PORT=8001
 
+# --- Prometheus multiprocess metrics ---
+export PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_metrics
+rm -rf "$PROMETHEUS_MULTIPROC_DIR"
+mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
+
 # --- MIG detection ---
 MIG_ENABLED=false
 MIG_UUIDS=()

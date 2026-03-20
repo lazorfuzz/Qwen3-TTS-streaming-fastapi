@@ -31,7 +31,7 @@ RUN pip uninstall flash-attn -y || true
 RUN pip install flash-attn --no-build-isolation --no-cache-dir -v
 
 # Install python requirements (from pyproject.toml)
-RUN pip install fastapi uvicorn pydantic soundfile gradio librosa sox onnxruntime einops transformers==4.57.3 accelerate==1.12.0
+RUN pip install fastapi uvicorn pydantic soundfile gradio librosa sox onnxruntime einops transformers==4.57.3 accelerate==1.12.0 prometheus_client
 
 # Copy source code
 COPY . /app
