@@ -66,7 +66,7 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-DEFAULT_VOICE_CLONE_REF_PATH = "eesha_voice_cloning.wav"
+DEFAULT_VOICE_CLONE_REF_PATH = "voice_cloning_slower_higher.wav" # "eesha_voice_cloning.wav"
 DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
 
 VOICE_META_DIR = os.environ.get("TTS_VOICE_META_DIR", "/app/voices")
