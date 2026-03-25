@@ -87,6 +87,17 @@ Run a concurrency test (default 2 concurrent requests):
 ./concurrency_test.sh http://<host>:8000 4       # custom host, 4 requests
 ```
 
+Adding a new voice cloning audio:
+```bash
+curl -N -X POST "http://<host>:8000/v1/add_voice" -F "file=@../output_voice_design.wav" -F "ref_text=Its in the top drawer. Wait, its empty? No way, thats impossible, Im sure I put it there"
+```
+All workers will pick up new cloning audios added within 5 seconds and begin their prewarm, this may take up to 1min.
+
+Then, to use a specific voice, the cloning_audio_filename field:
+```bash
+curl -N -s -X POST http://<host>:8000/v1/audio/speech -H "Content-Type: application/json" -d '{"input": "옛날에 큰 호랑이 한 마리가 숲  속에 살았다. 어느 날 호랑이는 배가 고파서 마을로 갔다. 마을 옆 밭에 소 한 마리가 서 있었다.", "language_id": "ko", "cloning_audio_filename": "output_voice_design.wav"}' | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -
+```
+
 ## Installation (python 3.12)
 
 > Note: torch versions differ between Linux/Windows due to available flash_attn prebuilt wheels.
