@@ -410,10 +410,14 @@ async def add_voice(
     Upload a voice cloning reference audio file with its transcript.
     Returns a voice_id that can be passed as cloning_audio_filename in /v1/audio/speech.
     """
-    voice_id = uuid.uuid4().hex
-    ext = os.path.splitext(file.filename)[1] if file.filename else ".wav"
-    saved_filename = f"{voice_id}{ext}"
+    saved_filename = file.filename or f"{uuid.uuid4().hex}.wav"
     saved_path = os.path.join(VOICE_UPLOAD_DIR, saved_filename)
+
+    # If a file with the same name already exists, append a suffix
+    if os.path.exists(saved_path):
+        name, ext = os.path.splitext(saved_filename)
+        saved_filename = f"{name}_{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = os.path.join(VOICE_UPLOAD_DIR, saved_filename)
 
     try:
         with open(saved_path, "wb") as f:
@@ -449,8 +453,12 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     if body.cloning_audio_filename:
         print(f"[INFO] Using cloning audio: {body.cloning_audio_filename}", flush=True)
         loaded = _get_voice_clone_prompt(body.cloning_audio_filename)
-        if loaded is not None:
-            voice_clone_prompt = loaded
+        if loaded is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{body.cloning_audio_filename}' not found. Upload it first via /v1/add_voice.",
+            )
+        voice_clone_prompt = loaded
 
     print(f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}", flush=True)
 
