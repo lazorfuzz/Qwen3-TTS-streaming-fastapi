@@ -216,7 +216,15 @@ class BatchScheduler:
 
     async def _scheduler_loop(self):
         while True:
-            batch = [await self._pending.get()]
+            # Wait for a request, but use a timeout so we can preload
+            # new voices during idle time
+            try:
+                first = await asyncio.wait_for(self._pending.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                await self._preload_new_voices()
+                continue
+
+            batch = [first]
             deadline = time.monotonic() + self.max_wait_s
             while len(batch) < self.max_batch_size:
                 remaining = deadline - time.monotonic()
@@ -243,6 +251,40 @@ class BatchScheduler:
     def _enqueue(self, q: asyncio.Queue, item):
         """Thread-safe put onto an asyncio.Queue."""
         self._loop.call_soon_threadsafe(q.put_nowait, item)
+
+    async def _preload_new_voices(self):
+        """Scan metadata dir for voices not yet in cache and load them.
+
+        Called during idle time (no pending TTS requests) so it never
+        competes with active generation for the GPU.
+        """
+        try:
+            for fname in os.listdir(VOICE_META_DIR):
+                if not fname.endswith(".json"):
+                    continue
+                # fname is e.g. "english_park_audio.wav.json"
+                voice_filename = fname[:-5]  # strip ".json"
+                full_path = os.path.join(VOICE_UPLOAD_DIR, voice_filename)
+                if full_path in VOICE_CLONE_CACHE:
+                    continue
+
+                # New voice found — load it
+                meta_path = os.path.join(VOICE_META_DIR, fname)
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+
+                print(f"[PRELOAD] PID={os.getpid()} loading voice: {voice_filename}", flush=True)
+                prompt = await self._loop.run_in_executor(
+                    None,
+                    lambda m=meta: model.create_voice_clone_prompt(m["ref_audio"], m["ref_text"])[0],
+                )
+                VOICE_CLONE_CACHE[full_path] = prompt
+                print(f"[PRELOAD] PID={os.getpid()} voice ready: {voice_filename}", flush=True)
+
+                # Only preload one per cycle to stay responsive to incoming requests
+                return
+        except Exception as e:
+            print(f"[PRELOAD_ERROR] PID={os.getpid()} {e}", flush=True)
 
     def _generate_batch(self, batch: list[_BatchItem]):
         finished = set()   # indices whose sentinel has already been sent
