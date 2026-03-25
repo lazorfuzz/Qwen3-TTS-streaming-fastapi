@@ -22,14 +22,24 @@ import threading
 import traceback
 import numpy as np
 from fastapi import Depends, FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
+from prometheus_client.multiprocess import MultiProcessCollector
 from qwen_tts import Qwen3TTSModel
 import time
 import torch
 import torch._dynamo
 from typing import Optional
 from dataclasses import dataclass
+
+from metrics import (
+    ACTIVE_REQUESTS,
+    REQUEST_COUNT,
+    REQUEST_DURATION,
+    TTFB_HISTOGRAM,
+    BATCH_SIZE_HISTOGRAM,
+)
 
 # Increase recompile limit: the talker forward has many calling patterns
 # (prefill vs decode, different kwargs combos, different batch sizes).
@@ -46,8 +56,19 @@ _SENTINEL = object()
 
 app = FastAPI()
 
-DEFAULT_VOICE_CLONE_REF_PATH = "eesha_voice_cloning.wav"
-DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
+
+@app.get("/metrics")
+async def metrics():
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        registry = CollectorRegistry()
+        MultiProcessCollector(registry)
+        return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+DEFAULT_VOICE_CLONE_REF_PATH = "voice_cloning_slower_higher.wav" # "eesha_voice_cloning.wav"
+# DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
+DEFAULT_TEXT = "Hello. This is a sample audio. The quick brown fox jumps over the lazy dog."
 
 VOICE_META_DIR = os.environ.get("TTS_VOICE_META_DIR", "/app/voices")
 API_KEY = os.environ.get("TTS_API_KEY")
@@ -108,6 +129,7 @@ for _ in model.stream_generate_voice_clone(
     emit_every_frames=4,
     decode_window_frames=80,
     overlap_samples=0,
+    max_frames=500,
 ):
     pass
 
@@ -122,6 +144,7 @@ if MAX_BATCH_SIZE > 1:
         emit_every_frames=4,
         decode_window_frames=80,
         overlap_samples=0,
+        max_frames=500,
     ):
         pass
 
@@ -201,6 +224,7 @@ class BatchScheduler:
                     )
                 except asyncio.TimeoutError:
                     break
+            BATCH_SIZE_HISTOGRAM.observe(len(batch))
             print(f"[SCHED] Dispatching batch of {len(batch)} request(s)", flush=True)
             try:
                 await self._loop.run_in_executor(None, self._generate_batch, batch)
@@ -403,17 +427,30 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     print(f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}", flush=True)
 
     output_queue, stop_event = await scheduler.submit(text, language, voice_clone_prompt)
+    request_start = time.time()
+    ACTIVE_REQUESTS.inc()
 
     async def audio_stream():
+        first_chunk = True
+        status = "success"
         try:
             while True:
                 chunk = await output_queue.get()
                 if chunk is _SENTINEL:
                     break
+                if first_chunk:
+                    TTFB_HISTOGRAM.observe(time.time() - request_start)
+                    first_chunk = False
                 pcm = np.clip(chunk, -1.0, 1.0)
                 yield (pcm * 32767.0).astype(np.int16).tobytes()
+        except Exception:
+            status = "error"
+            raise
         finally:
             stop_event.set()
+            ACTIVE_REQUESTS.dec()
+            REQUEST_COUNT.labels(status=status).inc()
+            REQUEST_DURATION.observe(time.time() - request_start)
 
     headers = {
         "Content-Type": "audio/L16; rate=24000",
