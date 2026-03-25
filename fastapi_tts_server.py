@@ -18,10 +18,12 @@ import asyncio
 import hmac
 import json
 import os
+import shutil
 import threading
 import traceback
+import uuid
 import numpy as np
-from fastapi import Depends, FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Request, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
@@ -74,7 +76,9 @@ VOICE_META_DIR = os.environ.get("TTS_VOICE_META_DIR", "/app/voices")
 API_KEY = os.environ.get("TTS_API_KEY")
 MAX_BATCH_SIZE = int(os.environ.get("TTS_MAX_BATCH_SIZE", "8"))
 BATCH_WAIT_S = int(os.environ.get("TTS_BATCH_WAIT_MS", "50")) / 1000.0
+VOICE_UPLOAD_DIR = os.environ.get("TTS_VOICE_UPLOAD_DIR", "/app/voice_uploads")
 os.makedirs(VOICE_META_DIR, exist_ok=True)
+os.makedirs(VOICE_UPLOAD_DIR, exist_ok=True)
 
 print(f"[INIT] Loading model (PID={os.getpid()})...", flush=True)
 
@@ -212,7 +216,15 @@ class BatchScheduler:
 
     async def _scheduler_loop(self):
         while True:
-            batch = [await self._pending.get()]
+            # Wait for a request, but use a timeout so we can preload
+            # new voices during idle time
+            try:
+                first = await asyncio.wait_for(self._pending.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                await self._preload_new_voices()
+                continue
+
+            batch = [first]
             deadline = time.monotonic() + self.max_wait_s
             while len(batch) < self.max_batch_size:
                 remaining = deadline - time.monotonic()
@@ -239,6 +251,40 @@ class BatchScheduler:
     def _enqueue(self, q: asyncio.Queue, item):
         """Thread-safe put onto an asyncio.Queue."""
         self._loop.call_soon_threadsafe(q.put_nowait, item)
+
+    async def _preload_new_voices(self):
+        """Scan metadata dir for voices not yet in cache and load them.
+
+        Called during idle time (no pending TTS requests) so it never
+        competes with active generation for the GPU.
+        """
+        try:
+            for fname in os.listdir(VOICE_META_DIR):
+                if not fname.endswith(".json"):
+                    continue
+                # fname is e.g. "english_park_audio.wav.json"
+                voice_filename = fname[:-5]  # strip ".json"
+                full_path = os.path.join(VOICE_UPLOAD_DIR, voice_filename)
+                if full_path in VOICE_CLONE_CACHE:
+                    continue
+
+                # New voice found — load it
+                meta_path = os.path.join(VOICE_META_DIR, fname)
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+
+                print(f"[PRELOAD] PID={os.getpid()} loading voice: {voice_filename}", flush=True)
+                prompt = await self._loop.run_in_executor(
+                    None,
+                    lambda m=meta: model.create_voice_clone_prompt(m["ref_audio"], m["ref_text"])[0],
+                )
+                VOICE_CLONE_CACHE[full_path] = prompt
+                print(f"[PRELOAD] PID={os.getpid()} voice ready: {voice_filename}", flush=True)
+
+                # Only preload one per cycle to stay responsive to incoming requests
+                return
+        except Exception as e:
+            print(f"[PRELOAD_ERROR] PID={os.getpid()} {e}", flush=True)
 
     def _generate_batch(self, batch: list[_BatchItem]):
         finished = set()   # indices whose sentinel has already been sent
@@ -346,11 +392,24 @@ async def verify_api_key(request: Request):
 # ---------------------------------------------------------------------------
 
 def _get_voice_clone_prompt(filepath: str):
-    """Load voice clone prompt from cache or disk metadata. Returns None if not found."""
+    """Load voice clone prompt from cache or disk metadata. Returns None if not found.
+
+    ``filepath`` can be a full path (legacy) or a voice_id filename returned by
+    /v1/add_voice.  For voice_id lookups we resolve the full path via
+    VOICE_UPLOAD_DIR so callers don't need to know where files are stored.
+    """
     if filepath in VOICE_CLONE_CACHE:
         return VOICE_CLONE_CACHE[filepath]
 
-    basename = os.path.basename(filepath)
+    # If filepath is just a filename (voice_id), resolve to the upload dir
+    if not os.path.isabs(filepath):
+        full_path = os.path.join(VOICE_UPLOAD_DIR, filepath)
+        if full_path in VOICE_CLONE_CACHE:
+            return VOICE_CLONE_CACHE[full_path]
+    else:
+        full_path = filepath
+
+    basename = os.path.basename(full_path)
     meta_path = os.path.join(VOICE_META_DIR, f"{basename}.json")
     if not os.path.exists(meta_path):
         return None
@@ -359,7 +418,7 @@ def _get_voice_clone_prompt(filepath: str):
         meta = json.load(f)
 
     prompt = model.create_voice_clone_prompt(meta["ref_audio"], meta["ref_text"])[0]
-    VOICE_CLONE_CACHE[filepath] = prompt
+    VOICE_CLONE_CACHE[full_path] = prompt
     return prompt
 
 
@@ -380,35 +439,50 @@ class SpeechRequest(BaseModel):
     language_id: Optional[str] = None
 
 
-class AddVoiceRequest(BaseModel):
-    ref_audio_filename: str
-    ref_text: str
-
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/add_voice", dependencies=[Depends(verify_api_key)])
-async def add_voice(body: AddVoiceRequest):
+async def add_voice(
+    ref_text: str = Form(..., description="Transcript of the reference audio"),
+    file: UploadFile = File(..., description="Reference audio file (.wav, .mp3, .m4a, etc.)"),
+):
     """
-    Register a voice for cloning. The .wav file must already exist in /app.
-    Metadata is persisted to disk so other workers can load it on-demand.
+    Upload a voice cloning reference audio file with its transcript.
+    Returns a voice_id that can be passed as cloning_audio_filename in /v1/audio/speech.
     """
-    filepath = f"/app/{body.ref_audio_filename}"
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"File not found: {filepath}")
+    saved_filename = file.filename or f"{uuid.uuid4().hex}.wav"
+    saved_path = os.path.join(VOICE_UPLOAD_DIR, saved_filename)
+
+    # If a file with the same name already exists, append a suffix
+    if os.path.exists(saved_path):
+        name, ext = os.path.splitext(saved_filename)
+        saved_filename = f"{name}_{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = os.path.join(VOICE_UPLOAD_DIR, saved_filename)
 
     try:
-        meta_path = os.path.join(VOICE_META_DIR, f"{os.path.basename(body.ref_audio_filename)}.json")
+        with open(saved_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        await file.close()
+
+    try:
+        meta_path = os.path.join(VOICE_META_DIR, f"{saved_filename}.json")
         with open(meta_path, "w") as f:
-            json.dump({"ref_audio": filepath, "ref_text": body.ref_text}, f)
+            json.dump({"ref_audio": saved_path, "ref_text": ref_text}, f)
 
-        prompt = model.create_voice_clone_prompt(filepath, body.ref_text)[0]
-        VOICE_CLONE_CACHE[filepath] = prompt
+        prompt = model.create_voice_clone_prompt(saved_path, ref_text)[0]
+        VOICE_CLONE_CACHE[saved_path] = prompt
 
-        return {"status": "success", "message": f"Voice added: {body.ref_audio_filename}"}
+        return {
+            "status": "success",
+            "voice_id": saved_filename,
+            "message": f"Voice added. Use voice_id '{saved_filename}' as cloning_audio_filename in /v1/audio/speech.",
+        }
     except Exception as e:
+        if os.path.exists(saved_path):
+            os.remove(saved_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -421,8 +495,12 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     if body.cloning_audio_filename:
         print(f"[INFO] Using cloning audio: {body.cloning_audio_filename}", flush=True)
         loaded = _get_voice_clone_prompt(body.cloning_audio_filename)
-        if loaded is not None:
-            voice_clone_prompt = loaded
+        if loaded is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{body.cloning_audio_filename}' not found. Upload it first via /v1/add_voice.",
+            )
+        voice_clone_prompt = loaded
 
     print(f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}", flush=True)
 
@@ -465,6 +543,6 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
 @app.get("/")
 def root():
     return {
-        "message": "Qwen3-TTS Streaming FastAPI server. POST /v1/audio/speech /v1/add_voice",
+        "message": "Qwen3-TTS Streaming FastAPI server. POST /v1/audio/speech, POST /v1/add_voice (file upload)",
         "pid": os.getpid(),
     }
