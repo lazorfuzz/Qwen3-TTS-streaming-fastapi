@@ -67,7 +67,8 @@ async def metrics():
 
 
 DEFAULT_VOICE_CLONE_REF_PATH = "voice_cloning_slower_higher.wav" # "eesha_voice_cloning.wav"
-DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
+# DEFAULT_TEXT = "Hello. This is an audio recording that's at least 5 seconds long. How are you doing today? Bye!"
+DEFAULT_TEXT = "Hello. This is a sample audio. The quick brown fox jumps over the lazy dog."
 
 VOICE_META_DIR = os.environ.get("TTS_VOICE_META_DIR", "/app/voices")
 API_KEY = os.environ.get("TTS_API_KEY")
@@ -128,6 +129,7 @@ for _ in model.stream_generate_voice_clone(
     emit_every_frames=4,
     decode_window_frames=80,
     overlap_samples=0,
+    max_frames=500,
 ):
     pass
 
@@ -142,6 +144,7 @@ if MAX_BATCH_SIZE > 1:
         emit_every_frames=4,
         decode_window_frames=80,
         overlap_samples=0,
+        max_frames=500,
     ):
         pass
 
