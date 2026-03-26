@@ -40,14 +40,35 @@ fi
 
 echo "[entrypoint] Starting with ${NUM_WORKERS} worker(s)..."
 
-# Single worker: run uvicorn directly on port 8000 (no nginx needed)
+# Single worker: use supervisord for auto-restart (no nginx needed)
 if [ "$NUM_WORKERS" -eq 1 ]; then
-    echo "[entrypoint] Single worker mode — binding uvicorn directly to :8000"
+    echo "[entrypoint] Single worker mode — using supervisord for auto-restart"
+
+    ENV_LINE=""
     if [ "$MIG_ENABLED" = true ] && [ ${#MIG_UUIDS[@]} -gt 0 ]; then
-        export CUDA_VISIBLE_DEVICES="${MIG_UUIDS[0]}"
-        echo "[entrypoint] Using MIG device: ${CUDA_VISIBLE_DEVICES}"
+        ENV_LINE="environment=CUDA_VISIBLE_DEVICES=\"${MIG_UUIDS[0]}\""
+        echo "[entrypoint] Using MIG device: ${MIG_UUIDS[0]}"
     fi
-    exec uvicorn fastapi_tts_server:app --host 0.0.0.0 --port 8000
+
+    cat > /etc/supervisord.conf << SINGLE_EOF
+[supervisord]
+nodaemon=true
+logfile=/dev/stdout
+logfile_maxbytes=0
+
+[program:tts-worker-0]
+command=uvicorn fastapi_tts_server:app --host 0.0.0.0 --port 8000
+directory=/app
+${ENV_LINE}
+autorestart=true
+startretries=999
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+SINGLE_EOF
+
+    exec supervisord -c /etc/supervisord.conf
 fi
 
 # Multi-worker: use nginx + supervisord
