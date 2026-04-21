@@ -1,0 +1,21 @@
+services:
+  qwen3-tts:
+    build: .
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+      - ./voices:/app/voices
+    environment:
+      - TTS_NUM_WORKERS=${TTS_NUM_WORKERS:-1}
+      - TTS_API_KEY=${TTS_API_KEY:-}
+      - TTS_MAX_BATCH_SIZE=${TTS_MAX_BATCH_SIZE:-8}
+      - TTS_BATCH_WAIT_MS=${TTS_BATCH_WAIT_MS:-50}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
