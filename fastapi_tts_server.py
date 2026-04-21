@@ -77,17 +77,20 @@ API_KEY = os.environ.get("TTS_API_KEY")
 MAX_BATCH_SIZE = int(os.environ.get("TTS_MAX_BATCH_SIZE", "8"))
 BATCH_WAIT_S = int(os.environ.get("TTS_BATCH_WAIT_MS", "50")) / 1000.0
 VOICE_UPLOAD_DIR = os.environ.get("TTS_VOICE_UPLOAD_DIR", "/app/voice_uploads")
+MODEL_PATH = os.environ.get("TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+CUSTOM_VOICE_SPEAKER = os.environ.get("TTS_CUSTOM_VOICE_SPEAKER", "")
 os.makedirs(VOICE_META_DIR, exist_ok=True)
 os.makedirs(VOICE_UPLOAD_DIR, exist_ok=True)
 
-print(f"[INIT] Loading model (PID={os.getpid()})...", flush=True)
+print(f"[INIT] Loading model from {MODEL_PATH} (PID={os.getpid()})...", flush=True)
 
 model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    MODEL_PATH,
     device_map="cuda:0",
     dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
+    attn_implementation="sdpa",
 )
+IS_CUSTOM_VOICE = model.model.tts_model_type == "custom_voice"
 model.enable_streaming_optimizations(
     decode_window_frames=80,
     use_compile=True,
@@ -101,12 +104,18 @@ model.enable_streaming_optimizations(
 # In-process voice clone cache: filepath → VoiceClonePromptItem
 VOICE_CLONE_CACHE = {}
 
-# Pre-build default voice at startup
-# create_voice_clone_prompt returns List[VoiceClonePromptItem]; store the single item
-VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH] = model.create_voice_clone_prompt(
-    ref_audio=DEFAULT_VOICE_CLONE_REF_PATH,
-    ref_text=DEFAULT_TEXT,
-)[0]
+if IS_CUSTOM_VOICE:
+    # Custom voice model: no voice clone prompt needed, speaker is baked in
+    if not CUSTOM_VOICE_SPEAKER:
+        supported = model.get_supported_speakers()
+        CUSTOM_VOICE_SPEAKER = supported[0] if supported else "speaker_test"
+    print(f"[INIT] Custom voice model, speaker: {CUSTOM_VOICE_SPEAKER}", flush=True)
+else:
+    # Base model: pre-build default voice clone prompt at startup
+    VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH] = model.create_voice_clone_prompt(
+        ref_audio=DEFAULT_VOICE_CLONE_REF_PATH,
+        ref_text=DEFAULT_TEXT,
+    )[0]
 
 print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
 
@@ -123,34 +132,46 @@ print(f"[INIT] Model ready (PID={os.getpid()}).", flush=True)
 # pre-compiles the hot paths so real requests run at full speed.
 
 WARMUP_TEXT = "Warmup sentence for torch compile."
-_default_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]  # VoiceClonePromptItem
 
 print(f"[WARMUP] Compiling for batch_size=1...", flush=True)
-for _ in model.stream_generate_voice_clone(
-    text=WARMUP_TEXT,
-    language="English",
-    voice_clone_prompt=_default_prompt,
-    emit_every_frames=4,
-    decode_window_frames=80,
-    overlap_samples=0,
-    max_frames=500,
-):
-    pass
-
-if MAX_BATCH_SIZE > 1:
-    print(f"[WARMUP] Compiling for batch_size={MAX_BATCH_SIZE}...", flush=True)
-    _warmup_stops = [threading.Event() for _ in range(MAX_BATCH_SIZE)]
-    for _ in model.batched_stream_generate_voice_clone(
-        texts=[WARMUP_TEXT] * MAX_BATCH_SIZE,
-        language="English",
-        voice_clone_prompts=[_default_prompt] * MAX_BATCH_SIZE,
-        stop_events=_warmup_stops,
+if IS_CUSTOM_VOICE:
+    for _ in model.stream_generate_custom_voice(
+        text=WARMUP_TEXT,
+        speaker=CUSTOM_VOICE_SPEAKER,
+        language="Auto",
         emit_every_frames=4,
         decode_window_frames=80,
         overlap_samples=0,
         max_frames=500,
     ):
         pass
+else:
+    _default_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
+    for _ in model.stream_generate_voice_clone(
+        text=WARMUP_TEXT,
+        language="English",
+        voice_clone_prompt=_default_prompt,
+        emit_every_frames=4,
+        decode_window_frames=80,
+        overlap_samples=0,
+        max_frames=500,
+    ):
+        pass
+
+    if MAX_BATCH_SIZE > 1:
+        print(f"[WARMUP] Compiling for batch_size={MAX_BATCH_SIZE}...", flush=True)
+        _warmup_stops = [threading.Event() for _ in range(MAX_BATCH_SIZE)]
+        for _ in model.batched_stream_generate_voice_clone(
+            texts=[WARMUP_TEXT] * MAX_BATCH_SIZE,
+            language="English",
+            voice_clone_prompts=[_default_prompt] * MAX_BATCH_SIZE,
+            stop_events=_warmup_stops,
+            emit_every_frames=4,
+            decode_window_frames=80,
+            overlap_samples=0,
+            max_frames=500,
+        ):
+            pass
 
 print(f"[WARMUP] Compilation warmup complete (PID={os.getpid()}).", flush=True)
 
@@ -305,14 +326,25 @@ class BatchScheduler:
 
     def _generate_single(self, item: _BatchItem):
         ttfb_printed = False
-        for chunk, sr in self.model.stream_generate_voice_clone(
-            text=item.text,
-            language=item.language,
-            voice_clone_prompt=item.voice_clone_prompt,
-            emit_every_frames=4,
-            decode_window_frames=80,
-            overlap_samples=0,
-        ):
+        if IS_CUSTOM_VOICE:
+            gen = self.model.stream_generate_custom_voice(
+                text=item.text,
+                speaker=CUSTOM_VOICE_SPEAKER,
+                language=item.language,
+                emit_every_frames=4,
+                decode_window_frames=80,
+                overlap_samples=0,
+            )
+        else:
+            gen = self.model.stream_generate_voice_clone(
+                text=item.text,
+                language=item.language,
+                voice_clone_prompt=item.voice_clone_prompt,
+                emit_every_frames=4,
+                decode_window_frames=80,
+                overlap_samples=0,
+            )
+        for chunk, sr in gen:
             if item.stop_event.is_set():
                 print(f"[CANCEL] PID={os.getpid()} client disconnected: {item.text[:60]}", flush=True)
                 break
@@ -491,16 +523,18 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     text = body.input
     language = LANG_CODE_TO_NAME.get(body.language_id, body.language_id) if body.language_id else "auto"
 
-    voice_clone_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
-    if body.cloning_audio_filename:
-        print(f"[INFO] Using cloning audio: {body.cloning_audio_filename}", flush=True)
-        loaded = _get_voice_clone_prompt(body.cloning_audio_filename)
-        if loaded is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Voice '{body.cloning_audio_filename}' not found. Upload it first via /v1/add_voice.",
-            )
-        voice_clone_prompt = loaded
+    voice_clone_prompt = None
+    if not IS_CUSTOM_VOICE:
+        voice_clone_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
+        if body.cloning_audio_filename:
+            print(f"[INFO] Using cloning audio: {body.cloning_audio_filename}", flush=True)
+            loaded = _get_voice_clone_prompt(body.cloning_audio_filename)
+            if loaded is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Voice '{body.cloning_audio_filename}' not found. Upload it first via /v1/add_voice.",
+                )
+            voice_clone_prompt = loaded
 
     print(f"[REQ] /v1/audio/speech PID={os.getpid()} input: {text[:60]}", flush=True)
 
