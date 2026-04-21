@@ -47,6 +47,47 @@ MIG is also supported in Docker — pass `TTS_NUM_WORKERS=auto` and expose MIG d
 docker run --gpus all -e TTS_NUM_WORKERS=auto -p 8000:8000 -v $(pwd):/app -v $(pwd)/hf_cache:/root/.cache/huggingface --network=host qwen3-tts-server
 ```
 
+### Option A2: Docker Compose
+
+Wraps the same Docker image with auto-restart, health checks, and env var configuration in one command.
+
+```bash
+docker compose up -d --build
+```
+
+Configure via environment variables (inline or in a `.env` file):
+
+```bash
+TTS_NUM_WORKERS=4 TTS_API_KEY=my-secret docker compose up -d --build
+```
+
+Or create a `.env` file in the project root:
+
+```env
+TTS_NUM_WORKERS=2
+TTS_API_KEY=my-secret
+TTS_MAX_BATCH_SIZE=16
+TTS_BATCH_WAIT_MS=100
+```
+
+Then just `docker compose up -d --build`.
+
+Useful commands:
+
+```bash
+docker compose logs -f       # tail logs
+docker compose down          # stop and remove container
+docker compose restart       # restart container
+```
+
+The container will automatically restart if it crashes, gets OOM-killed, or the host reboots. Individual workers also auto-restart via supervisord if they crash.
+
+MIG is also supported — set `TTS_NUM_WORKERS=auto`:
+
+```bash
+TTS_NUM_WORKERS=auto docker compose up -d --build
+```
+
 ### Option B: Directly on a VM (no Docker, no sudo)
 
 Uses `entrypoint_local.sh`, which generates nginx and supervisord configs in a local `.run/` directory and does not require root.
@@ -85,6 +126,17 @@ Run a concurrency test (default 2 concurrent requests):
 ```bash
 ./concurrency_test.sh                            # 2 concurrent requests to localhost:8000
 ./concurrency_test.sh http://<host>:8000 4       # custom host, 4 requests
+```
+
+Adding a new voice cloning audio:
+```bash
+curl -N -X POST "http://<host>:8000/v1/add_voice" -F "file=@../output_voice_design.wav" -F "ref_text=Its in the top drawer. Wait, its empty? No way, thats impossible, Im sure I put it there"
+```
+All workers will pick up new cloning audios added within 5 seconds and begin their prewarm, this may take up to 1min.
+
+Then, to use a specific voice, the cloning_audio_filename field:
+```bash
+curl -N -s -X POST http://<host>:8000/v1/audio/speech -H "Content-Type: application/json" -d '{"input": "옛날에 큰 호랑이 한 마리가 숲  속에 살았다. 어느 날 호랑이는 배가 고파서 마을로 갔다. 마을 옆 밭에 소 한 마리가 서 있었다.", "language_id": "ko", "cloning_audio_filename": "output_voice_design.wav"}' | ffplay -nodisp -autoexit -f s16le -ar 24000 -ch_layout mono -
 ```
 
 ## Installation (python 3.12)
