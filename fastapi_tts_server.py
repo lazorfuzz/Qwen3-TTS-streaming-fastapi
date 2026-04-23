@@ -555,6 +555,8 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
                     first_chunk = False
                 pcm = np.clip(chunk, -1.0, 1.0)
                 yield (pcm * 32767.0).astype(np.int16).tobytes()
+            # Append ~200ms of silence so the client's audio buffer fully drains
+            yield np.zeros(4800, dtype=np.int16).tobytes()
         except Exception:
             status = "error"
             raise
