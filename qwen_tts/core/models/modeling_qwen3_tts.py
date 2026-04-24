@@ -72,18 +72,44 @@ def _top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 
     return logits
 
 
+def _apply_repetition_penalty(
+    logits: torch.Tensor,
+    generated_tokens: list[torch.Tensor],
+    penalty: float = 1.0,
+) -> torch.Tensor:
+    """Apply repetition penalty to logits based on previously generated tokens."""
+    if penalty == 1.0 or len(generated_tokens) == 0:
+        return logits
+    logits = logits.clone()
+    # Collect unique tokens generated so far
+    past = torch.cat(generated_tokens, dim=0) if len(generated_tokens) > 1 else generated_tokens[0]
+    unique_tokens = past.unique()
+    for token_id in unique_tokens:
+        score = logits[..., token_id]
+        # If score < 0, multiply by penalty (makes it more negative = less likely)
+        # If score > 0, divide by penalty (makes it less positive = less likely)
+        logits[..., token_id] = torch.where(score < 0, score * penalty, score / penalty)
+    return logits
+
+
 def _sample_next_token(
     logits: torch.Tensor,
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
     suppress_tokens: Optional[list[int]] = None,
+    generated_tokens: Optional[list[torch.Tensor]] = None,
+    repetition_penalty: float = 1.0,
 ) -> torch.Tensor:
-    """Sample next token from logits with temperature, top-k, top-p and token suppression."""
+    """Sample next token from logits with temperature, top-k, top-p, token suppression and repetition penalty."""
     # Suppress tokens by setting their logits to -inf
     if suppress_tokens is not None and len(suppress_tokens) > 0:
         logits = logits.clone()
         logits[..., suppress_tokens] = float("-inf")
+
+    # Apply repetition penalty
+    if generated_tokens is not None and repetition_penalty != 1.0:
+        logits = _apply_repetition_penalty(logits, generated_tokens, repetition_penalty)
 
     if temperature <= 0:
         return torch.argmax(logits, dim=-1)
@@ -2638,6 +2664,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         max_frames: int = 10000,
         # Optimization flags
         use_optimized_decode: bool = True,
+        # Repetition penalty (matches non-streaming generate)
+        repetition_penalty: float = 1.05,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2660,6 +2688,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             overlap_samples: Overlap samples for crossfade between chunks
             max_frames: Maximum number of codec frames to generate
             use_optimized_decode: Use CUDA graph optimized decode when available (default True)
+            repetition_penalty: Penalize repeated tokens to prevent degeneration (default 1.05, matches non-streaming)
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2714,11 +2743,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Sample first token from prefill logits
         last_logits = out.logits[:, -1, :]
+        generated_token_ids: list[torch.Tensor] = []  # Track for repetition penalty
         if do_sample:
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
-        # Debug removed for performance: first token sampled
+        generated_token_ids.append(token.detach())
 
         # Extract ref_code for decoder context (if in ICL mode)
         # This provides stable context from the start, eliminating early voice artifacts
@@ -2779,9 +2809,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
             if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+                token = _sample_next_token(
+                    step_logits, temperature, top_k, top_p, suppress_tokens,
+                    generated_tokens=generated_token_ids, repetition_penalty=repetition_penalty,
+                )
             else:
                 token = torch.argmax(step_logits, dim=-1)
+            generated_token_ids.append(token.detach())
 
             frames_since_emit += 1
             if frames_since_emit < emit_every_frames:
