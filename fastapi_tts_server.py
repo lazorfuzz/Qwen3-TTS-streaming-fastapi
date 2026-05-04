@@ -326,6 +326,8 @@ class BatchScheduler:
 
     def _generate_single(self, item: _BatchItem):
         ttfb_printed = False
+        chunk_count = 0
+        total_samples = 0
         if IS_CUSTOM_VOICE:
             gen = self.model.stream_generate_custom_voice(
                 text=item.text,
@@ -352,7 +354,11 @@ class BatchScheduler:
                 t = time.time() - item.start_time
                 print(f"[TTFB] PID={os.getpid()} {t:.3f}s input: {item.text[:60]}", flush=True)
                 ttfb_printed = True
+            chunk_count += 1
+            total_samples += len(chunk)
             self._enqueue(item.output_queue, chunk)
+        duration_sec = total_samples / 24000 if total_samples > 0 else 0
+        print(f"[GEN_DEBUG] PID={os.getpid()} chunks={chunk_count}, total_samples={total_samples}, duration={duration_sec:.2f}s, text: {item.text[:60]}", flush=True)
 
     def _generate_batched(self, batch: list[_BatchItem], finished: set):
         ttfb_printed = [False] * len(batch)
@@ -545,6 +551,8 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     async def audio_stream():
         first_chunk = True
         status = "success"
+        total_bytes = 0
+        http_chunks = 0
         try:
             while True:
                 chunk = await output_queue.get()
@@ -554,13 +562,20 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
                     TTFB_HISTOGRAM.observe(time.time() - request_start)
                     first_chunk = False
                 pcm = np.clip(chunk, -1.0, 1.0)
-                yield (pcm * 32767.0).astype(np.int16).tobytes()
+                data = (pcm * 32767.0).astype(np.int16).tobytes()
+                total_bytes += len(data)
+                http_chunks += 1
+                yield data
             # Append ~200ms of silence so the client's audio buffer fully drains
-            yield np.zeros(4800, dtype=np.int16).tobytes()
+            silence = np.zeros(4800, dtype=np.int16).tobytes()
+            total_bytes += len(silence)
+            yield silence
         except Exception:
             status = "error"
             raise
         finally:
+            duration_sec = (total_bytes / 2) / 24000  # 2 bytes per int16 sample
+            print(f"[HTTP_DEBUG] PID={os.getpid()} http_chunks={http_chunks}, total_bytes={total_bytes}, duration={duration_sec:.2f}s, text: {text[:60]}", flush=True)
             stop_event.set()
             ACTIVE_REQUESTS.dec()
             REQUEST_COUNT.labels(status=status).inc()

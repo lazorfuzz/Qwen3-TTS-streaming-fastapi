@@ -2801,6 +2801,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Check for EOS in first codebook ON GPU (avoids CPU sync bottleneck)
             # EOS token is out of range for speech tokenizer, so we must not include it
             if codec_ids[0, 0] == eos_id:
+                print(f"[STREAM_DEBUG] EOS at step {step_idx}, frames in buffer: {len(codes_buffer)}, frames_since_emit: {frames_since_emit}", flush=True)
                 break
 
             # Keep on GPU to avoid CPU<->GPU transfers during decode
@@ -2869,6 +2870,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
+        total_samples_yielded = total_frames_emitted * self.speech_tokenizer.get_decode_upsample_rate()
+        print(f"[STREAM_DEBUG] Loop done. total_frames={len(codes_buffer)}, emitted={total_frames_emitted}, remaining={remaining_frames}, samples_so_far~={total_samples_yielded}", flush=True)
         if remaining_frames > 0:
             # Decode a window that includes some context for quality
             context_frames = min(total_frames_emitted, decode_window_frames - remaining_frames)
@@ -2897,7 +2900,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     head = _crossfade(decoded_tail[-ov:], wav[:ov])
                     wav = np.concatenate([head, wav[ov:]], axis=0)
 
-            # Debug removed for performance: flush done
+            print(f"[STREAM_DEBUG] Flush decoded {remaining_frames} remaining frames -> {len(wav)} samples", flush=True)
             yield wav, sr
         elif overlap_samples > 0 and decoded_tail is not None:
             # No remaining frames to flush, but we held back tail samples
