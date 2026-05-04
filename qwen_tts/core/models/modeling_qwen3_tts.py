@@ -2810,7 +2810,23 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Check for EOS in first codebook ON GPU (avoids CPU sync bottleneck)
             # EOS token is out of range for speech tokenizer, so we must not include it
             if codec_ids[0, 0] == eos_id:
-                break
+                if len(codes_buffer) >= min_speech_frames:
+                    break
+                # Early EOS suppressed: sub-talker predicted EOS but we haven't
+                # generated enough frames yet. Skip this frame (can't decode EOS)
+                # but sample a new non-EOS token to keep the loop going.
+                step_logits = step_out.logits[:, -1, :]
+                if do_sample:
+                    token = _sample_next_token(
+                        step_logits, temperature, top_k, top_p, suppress_tokens_with_eos,
+                        generated_tokens=generated_token_ids, repetition_penalty=repetition_penalty,
+                    )
+                else:
+                    step_logits = step_logits.clone()
+                    step_logits[..., eos_id] = float("-inf")
+                    token = torch.argmax(step_logits, dim=-1)
+                generated_token_ids.append(token.detach())
+                continue
 
             # Keep on GPU to avoid CPU<->GPU transfers during decode
             codes_buffer.append(codec_ids[0].detach())
@@ -3079,14 +3095,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             for i in range(batch_size):
                 if not active[i]:
                     continue
-                eos_hit = codec_ids[i, 0] == eos_id and len(codes_buffers[i]) >= min_speech_frames
-                if eos_hit or stop_events[i].is_set():
+                is_eos = codec_ids[i, 0] == eos_id
+                eos_allowed = is_eos and len(codes_buffers[i]) >= min_speech_frames
+                if eos_allowed or stop_events[i].is_set():
                     active[i] = False
                     newly_finished.append(i)
                     # Signal completion so the server can send sentinel immediately
                     stop_events[i].set()
-                else:
+                elif not is_eos:
+                    # Only append non-EOS frames (EOS is out of range for speech tokenizer)
                     codes_buffers[i].append(codec_ids[i].detach())
+                # else: early EOS suppressed — skip this frame, keep item active
 
             if not any(active) and not newly_finished:
                 break
