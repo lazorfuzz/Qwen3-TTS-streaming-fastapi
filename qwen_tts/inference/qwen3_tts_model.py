@@ -706,6 +706,8 @@ class Qwen3TTSModel:
         max_frames: int = 10000,
         # Optimization
         use_optimized_decode: bool = True,
+        # Minimum frames before allowing EOS
+        min_speech_frames: int = 10,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -727,6 +729,7 @@ class Qwen3TTSModel:
             max_frames: Maximum codec frames to generate.
             use_optimized_decode: Use CUDA graph optimized decode when available (default True).
                                   Call enable_streaming_optimizations() first for best performance.
+            min_speech_frames: Suppress EOS for the first N frames to prevent premature cutoff (default 10).
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -805,6 +808,7 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
+            min_speech_frames=min_speech_frames,
             **gen_kwargs,
         ):
             yield chunk, sr
@@ -820,6 +824,7 @@ class Qwen3TTSModel:
         decode_window_frames: int = 80,
         overlap_samples: int = 512,
         max_frames: int = 10000,
+        min_speech_frames: int = 10,
         **kwargs,
     ) -> Generator[List[Optional[Tuple[np.ndarray, int]]], None, None]:
         """
@@ -840,6 +845,7 @@ class Qwen3TTSModel:
             decode_window_frames: Window size for decoding.
             overlap_samples: Overlap samples for crossfade between chunks.
             max_frames: Maximum codec frames to generate.
+            min_speech_frames: Suppress EOS for the first N frames to prevent premature cutoff (default 10).
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -917,6 +923,7 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=True,
+            min_speech_frames=min_speech_frames,
             **gen_kwargs,
         ):
             yield results
@@ -1142,6 +1149,8 @@ class Qwen3TTSModel:
         max_frames: int = 10000,
         # Optimization
         use_optimized_decode: bool = True,
+        # Minimum frames before allowing EOS
+        min_speech_frames: int = 10,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1160,6 +1169,7 @@ class Qwen3TTSModel:
             overlap_samples: Overlap samples for crossfade between chunks.
             max_frames: Maximum codec frames to generate.
             use_optimized_decode: Use CUDA graph optimized decode when available.
+            min_speech_frames: Suppress EOS for the first N frames to prevent premature cutoff (default 10).
             **kwargs: Generation parameters (do_sample, top_k, top_p, temperature, etc.)
 
         Yields:
@@ -1206,6 +1216,7 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
+            min_speech_frames=min_speech_frames,
             **gen_kwargs,
         ):
             yield chunk, sr

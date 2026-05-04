@@ -2666,6 +2666,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         use_optimized_decode: bool = True,
         # Repetition penalty (matches non-streaming generate)
         repetition_penalty: float = 1.05,
+        # Minimum frames before allowing EOS (prevents premature speech cutoff)
+        min_speech_frames: int = 10,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2689,6 +2691,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             max_frames: Maximum number of codec frames to generate
             use_optimized_decode: Use CUDA graph optimized decode when available (default True)
             repetition_penalty: Penalize repeated tokens to prevent degeneration (default 1.05, matches non-streaming)
+            min_speech_frames: Suppress EOS token for the first N frames to prevent premature cutoff (default 10)
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2713,6 +2716,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             i for i in range(vocab_size - 1024, vocab_size)
             if i != eos_id
         ]
+        # Also build a list that includes EOS for early-frame suppression
+        suppress_tokens_with_eos = suppress_tokens + [eos_id]
 
         # Mark step begin for CUDA graphs (required for torch.compile with reduce-overhead)
         torch.compiler.cudagraph_mark_step_begin()
@@ -2741,13 +2746,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Debug removed for performance: prefill done
 
-        # Sample first token from prefill logits
+        # Sample first token from prefill logits (suppress EOS to prevent immediate termination)
         last_logits = out.logits[:, -1, :]
         generated_token_ids: list[torch.Tensor] = []  # Track for repetition penalty
+        prefill_suppress = suppress_tokens_with_eos if min_speech_frames > 0 else suppress_tokens
         if do_sample:
-            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
+            token = _sample_next_token(last_logits, temperature, top_k, top_p, prefill_suppress)
         else:
-            token = torch.argmax(last_logits, dim=-1)
+            last_logits_copy = last_logits.clone()
+            if min_speech_frames > 0:
+                last_logits_copy[..., eos_id] = float("-inf")
+            token = torch.argmax(last_logits_copy, dim=-1)
         generated_token_ids.append(token.detach())
 
         # Extract ref_code for decoder context (if in ICL mode)
@@ -2807,13 +2816,18 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             codes_buffer.append(codec_ids[0].detach())
 
             # Sample next token for first codebook
+            # Suppress EOS for early frames to prevent premature speech cutoff
             step_logits = step_out.logits[:, -1, :]
+            current_suppress = suppress_tokens_with_eos if len(codes_buffer) < min_speech_frames else suppress_tokens
             if do_sample:
                 token = _sample_next_token(
-                    step_logits, temperature, top_k, top_p, suppress_tokens,
+                    step_logits, temperature, top_k, top_p, current_suppress,
                     generated_tokens=generated_token_ids, repetition_penalty=repetition_penalty,
                 )
             else:
+                if len(codes_buffer) < min_speech_frames:
+                    step_logits = step_logits.clone()
+                    step_logits[..., eos_id] = float("-inf")
                 token = torch.argmax(step_logits, dim=-1)
             generated_token_ids.append(token.detach())
 
@@ -2876,19 +2890,18 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
 
             # Add ref_code as context prefix for stable decoder context
-            window, flush_ref_prefix_frames = _add_ref_code_context(
+            window, _ = _add_ref_code_context(
                 window_codes, ref_code_context, ref_code_frames, decode_window_frames
             )
 
             wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
             wav = wavs[0].astype(np.float32)
 
-            # Extract only the new samples (skip ref_code and context portions)
-            skip_frames = flush_ref_prefix_frames + context_frames
-            if skip_frames > 0:
-                samples_per_frame = len(wav) / window.shape[0]
-                skip_samples = int(skip_frames * samples_per_frame)
-                wav = wav[skip_samples:]
+            # Extract only the new samples from the tail (matching main loop pattern)
+            # Use integer arithmetic to avoid float drift from len(wav)/window.shape[0]
+            samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
+            remaining_samples = samples_per_frame * remaining_frames
+            wav = wav[-remaining_samples:] if remaining_samples < len(wav) else wav
 
             # Crossfade with previous tail
             if decoded_tail is not None and overlap_samples > 0 and len(wav) > 0:
@@ -2929,6 +2942,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         overlap_samples: int = 0,
         max_frames: int = 10000,
         use_optimized_decode: bool = True,
+        # Minimum frames before allowing EOS (prevents premature speech cutoff)
+        min_speech_frames: int = 10,
     ) -> Generator[list[Optional[tuple[np.ndarray, int]]], None, None]:
         """
         Batched streaming audio generation, yielding per-item PCM chunks.
@@ -2976,6 +2991,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             i for i in range(vocab_size - 1024, vocab_size)
             if i != eos_id
         ]
+        suppress_tokens_with_eos = suppress_tokens + [eos_id]
 
         # --- Prefill phase ---
         torch.compiler.cudagraph_mark_step_begin()
@@ -3001,11 +3017,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         past_hidden = out.past_hidden
         generation_step = out.generation_step
 
-        # Sample first token from prefill logits
+        # Sample first token from prefill logits (suppress EOS to prevent immediate termination)
         last_logits = out.logits[:, -1, :]
+        prefill_suppress = suppress_tokens_with_eos if min_speech_frames > 0 else suppress_tokens
         if do_sample:
-            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
+            token = _sample_next_token(last_logits, temperature, top_k, top_p, prefill_suppress)
         else:
+            if min_speech_frames > 0:
+                last_logits = last_logits.clone()
+                last_logits[..., eos_id] = float("-inf")
             token = torch.argmax(last_logits, dim=-1)
 
         # --- Per-item state ---
@@ -3054,11 +3074,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
 
             # Per-item EOS + cancellation check
+            # Only allow EOS if item has generated at least min_speech_frames
             newly_finished = []
             for i in range(batch_size):
                 if not active[i]:
                     continue
-                if codec_ids[i, 0] == eos_id or stop_events[i].is_set():
+                eos_hit = codec_ids[i, 0] == eos_id and len(codes_buffers[i]) >= min_speech_frames
+                if eos_hit or stop_events[i].is_set():
                     active[i] = False
                     newly_finished.append(i)
                     # Signal completion so the server can send sentinel immediately
@@ -3070,10 +3092,19 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 break
 
             # Sample next token (batched)
+            # Suppress EOS for early frames to prevent premature speech cutoff
             step_logits = step_out.logits[:, -1, :]
+            any_below_min = any(
+                active[i] and len(codes_buffers[i]) < min_speech_frames
+                for i in range(batch_size)
+            )
+            current_suppress = suppress_tokens_with_eos if any_below_min else suppress_tokens
             if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+                token = _sample_next_token(step_logits, temperature, top_k, top_p, current_suppress)
             else:
+                if any_below_min:
+                    step_logits = step_logits.clone()
+                    step_logits[..., eos_id] = float("-inf")
                 token = torch.argmax(step_logits, dim=-1)
 
             frames_since_emit += 1
@@ -3216,18 +3247,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         start_idx = total_frames_emitted[item_idx] - context_frames
         window_codes = torch.stack(codes_buffer[start_idx:], dim=0)
 
-        window, flush_ref_prefix_frames = _add_ref_code_context(
+        window, _ = _add_ref_code_context(
             window_codes, ref_code_context, ref_code_frames, decode_window_frames
         )
 
         wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
         wav = wavs[0].astype(np.float32)
 
-        skip_frames = flush_ref_prefix_frames + context_frames
-        if skip_frames > 0:
-            spf = len(wav) / window.shape[0]
-            skip_samples = int(skip_frames * spf)
-            wav = wav[skip_samples:]
+        # Extract only the new samples from the tail (matching main loop pattern)
+        samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
+        remaining_samples = samples_per_frame * remaining_frames
+        wav = wav[-remaining_samples:] if remaining_samples < len(wav) else wav
 
         if decoded_tails[item_idx] is not None and overlap_samples > 0 and len(wav) > 0:
             ov = min(overlap_samples, len(decoded_tails[item_idx]), len(wav))
