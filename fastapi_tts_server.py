@@ -336,6 +336,7 @@ class BatchScheduler:
                 emit_every_frames=4,
                 decode_window_frames=80,
                 overlap_samples=0,
+                repetition_penalty=1.15,
             )
         else:
             gen = self.model.stream_generate_voice_clone(
@@ -345,6 +346,7 @@ class BatchScheduler:
                 emit_every_frames=4,
                 decode_window_frames=80,
                 overlap_samples=0,
+                repetition_penalty=1.15,
             )
         for chunk, sr in gen:
             if item.stop_event.is_set():
