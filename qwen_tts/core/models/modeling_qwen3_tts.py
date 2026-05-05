@@ -2932,6 +2932,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         overlap_samples: int = 0,
         max_frames: int = 10000,
         use_optimized_decode: bool = True,
+        # Repetition penalty (matches non-streaming generate)
+        repetition_penalty: float = 1.05,
     ) -> Generator[list[Optional[tuple[np.ndarray, int]]], None, None]:
         """
         Batched streaming audio generation, yielding per-item PCM chunks.
@@ -3006,10 +3008,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Sample first token from prefill logits
         last_logits = out.logits[:, -1, :]
+        generated_token_ids: list[torch.Tensor] = []
         if do_sample:
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
+        generated_token_ids.append(token.detach())
 
         # --- Per-item state ---
         active = [True] * batch_size
@@ -3075,9 +3079,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Sample next token (batched)
             step_logits = step_out.logits[:, -1, :]
             if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+                token = _sample_next_token(
+                    step_logits, temperature, top_k, top_p, suppress_tokens,
+                    generated_tokens=generated_token_ids, repetition_penalty=repetition_penalty,
+                )
             else:
                 token = torch.argmax(step_logits, dim=-1)
+            generated_token_ids.append(token.detach())
 
             frames_since_emit += 1
             need_emit = frames_since_emit >= emit_every_frames
