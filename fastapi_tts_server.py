@@ -79,6 +79,7 @@ BATCH_WAIT_S = int(os.environ.get("TTS_BATCH_WAIT_MS", "50")) / 1000.0
 VOICE_UPLOAD_DIR = os.environ.get("TTS_VOICE_UPLOAD_DIR", "/app/voice_uploads")
 MODEL_PATH = os.environ.get("TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 CUSTOM_VOICE_SPEAKER = os.environ.get("TTS_CUSTOM_VOICE_SPEAKER", "")
+VOICE_DESIGN_INSTRUCT = os.environ.get("TTS_VOICE_DESIGN_INSTRUCT", "a warm, friendly female voice")
 os.makedirs(VOICE_META_DIR, exist_ok=True)
 os.makedirs(VOICE_UPLOAD_DIR, exist_ok=True)
 
@@ -91,6 +92,7 @@ model = Qwen3TTSModel.from_pretrained(
     attn_implementation="sdpa",
 )
 IS_CUSTOM_VOICE = model.model.tts_model_type == "custom_voice"
+IS_VOICE_DESIGN = model.model.tts_model_type == "voice_design"
 model.enable_streaming_optimizations(
     decode_window_frames=80,
     use_compile=True,
@@ -110,6 +112,9 @@ if IS_CUSTOM_VOICE:
         supported = model.get_supported_speakers()
         CUSTOM_VOICE_SPEAKER = supported[0] if supported else "speaker_test"
     print(f"[INIT] Custom voice model, speaker: {CUSTOM_VOICE_SPEAKER}", flush=True)
+elif IS_VOICE_DESIGN:
+    # VoiceDesign model: no voice clone prompt needed, voice is defined by instruct text
+    print(f"[INIT] VoiceDesign model, instruct: {VOICE_DESIGN_INSTRUCT}", flush=True)
 else:
     # Base model: pre-build default voice clone prompt at startup
     VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH] = model.create_voice_clone_prompt(
@@ -138,6 +143,17 @@ if IS_CUSTOM_VOICE:
     for _ in model.stream_generate_custom_voice(
         text=WARMUP_TEXT,
         speaker=CUSTOM_VOICE_SPEAKER,
+        language="Auto",
+        emit_every_frames=4,
+        decode_window_frames=80,
+        overlap_samples=0,
+        max_frames=500,
+    ):
+        pass
+elif IS_VOICE_DESIGN:
+    for _ in model.stream_generate_voice_design(
+        text=WARMUP_TEXT,
+        instruct=VOICE_DESIGN_INSTRUCT,
         language="Auto",
         emit_every_frames=4,
         decode_window_frames=80,
@@ -279,6 +295,8 @@ class BatchScheduler:
         Called during idle time (no pending TTS requests) so it never
         competes with active generation for the GPU.
         """
+        if IS_CUSTOM_VOICE or IS_VOICE_DESIGN:
+            return
         try:
             for fname in os.listdir(VOICE_META_DIR):
                 if not fname.endswith(".json"):
@@ -310,8 +328,10 @@ class BatchScheduler:
     def _generate_batch(self, batch: list[_BatchItem]):
         finished = set()   # indices whose sentinel has already been sent
         try:
-            if len(batch) == 1:
-                self._generate_single(batch[0])
+            if len(batch) == 1 or IS_VOICE_DESIGN:
+                # VoiceDesign has no batched streaming method, process sequentially
+                for item in batch:
+                    self._generate_single(item)
             else:
                 self._generate_batched(batch, finished)
         except Exception as e:
@@ -330,6 +350,15 @@ class BatchScheduler:
             gen = self.model.stream_generate_custom_voice(
                 text=item.text,
                 speaker=CUSTOM_VOICE_SPEAKER,
+                language=item.language,
+                emit_every_frames=4,
+                decode_window_frames=80,
+                overlap_samples=0,
+            )
+        elif IS_VOICE_DESIGN:
+            gen = self.model.stream_generate_voice_design(
+                text=item.text,
+                instruct=VOICE_DESIGN_INSTRUCT,
                 language=item.language,
                 emit_every_frames=4,
                 decode_window_frames=80,
@@ -524,7 +553,7 @@ async def speech_endpoint(request: Request, body: SpeechRequest):
     language = LANG_CODE_TO_NAME.get(body.language_id, body.language_id) if body.language_id else "auto"
 
     voice_clone_prompt = None
-    if not IS_CUSTOM_VOICE:
+    if not IS_CUSTOM_VOICE and not IS_VOICE_DESIGN:
         voice_clone_prompt = VOICE_CLONE_CACHE[DEFAULT_VOICE_CLONE_REF_PATH]
         if body.cloning_audio_filename:
             print(f"[INFO] Using cloning audio: {body.cloning_audio_filename}", flush=True)
