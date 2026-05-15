@@ -2918,6 +2918,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        repetition_penalty: float = 1.0,
         # Sub-talker parameters (for remaining code groups)
         subtalker_dosample: bool = True,
         subtalker_top_k: int = 50,
@@ -3002,11 +3003,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         generation_step = out.generation_step
 
         # Sample first token from prefill logits
+        generated_token_ids: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
         last_logits = out.logits[:, -1, :]
         if do_sample:
-            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
+            token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens,
+                                       generated_tokens=None, repetition_penalty=repetition_penalty)
         else:
             token = torch.argmax(last_logits, dim=-1)
+        for i in range(batch_size):
+            generated_token_ids[i].append(token[i])
 
         # --- Per-item state ---
         active = [True] * batch_size
@@ -3072,9 +3077,13 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Sample next token (batched)
             step_logits = step_out.logits[:, -1, :]
             if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens,
+                                           generated_tokens=None, repetition_penalty=repetition_penalty)
             else:
                 token = torch.argmax(step_logits, dim=-1)
+            for i in range(batch_size):
+                if active[i]:
+                    generated_token_ids[i].append(token[i])
 
             frames_since_emit += 1
             need_emit = frames_since_emit >= emit_every_frames
